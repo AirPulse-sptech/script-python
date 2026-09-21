@@ -1,17 +1,16 @@
-# Lê arquivos CSV usando os nomes das colunas.
+
 import csv
 
-# Trabalha com pastas e caminhos de arquivos.
+# Trabalha com pastas e caminhos de arquivos
 import glob
 
-# Converte e formata datas e horários.
 from datetime import datetime
 
 
 # Mostra uma mensagem de acordo com o percentual de uso da CPU.
 def cpu_use(cpu):
 
-    # As condições são verificadas em ordem.
+    # Condições são verificadas em ordem.
     # Quando uma delas é atendida, as seguintes não são executadas.
     if cpu < 10.0:
         print("Uso de CPU normal.")
@@ -46,7 +45,7 @@ def cpu_use(cpu):
             "Recomenda-se intervenção urgente."
         )
 
-    # Entra aqui quando o uso é de 95% ou mais.
+    # Entra aqui se o uso é de 95% ou mais.
     else:
         print(
             "Uso de CPU extremamente crítico. "
@@ -57,16 +56,13 @@ def cpu_use(cpu):
 # Recebe o percentual de uso e a capacidade total da RAM em bytes.
 def ram_use(ram, ram_total):
 
-    # Calcula a quantidade de memória usada com base no percentual.
+    # Qtd de memória usada percentual.
     ram_usada = ram_total * (ram / 100)
 
-    # Converte bytes para GiB, embora as mensagens usem a sigla GB.
-    # ** significa potência: 1024 ** 3 é 1024 elevado ao cubo.
+    # Converte bytes para GiB
     ram_usada_gb = ram_usada / (1024 ** 3)
     ram_total_gb = ram_total / (1024 ** 3)
 
-    # O f antes das aspas permite colocar variáveis dentro das chaves.
-    # :.1f mostra uma casa decimal e :.2f mostra duas.
     if ram < 10.0:
         print(
             f"RAM normal: {ram:.1f}% "
@@ -116,13 +112,13 @@ def ram_use(ram, ram_total):
         )
 
 
-# Recebe o percentual de uso e a capacidade total do disco em bytes.
+# Recebe o percentual de uso e a capacidade total do disco (bytes).
 def disco_use(disco, disco_total):
 
-    # Calcula o espaço usado com base no percentual.
+    # Calcula o espaço usado em percentual
     disco_usado = disco_total * (disco / 100)
 
-    # Converte bytes para GiB, embora as mensagens usem a sigla GB.
+    # Converte bytes para GiB
     disco_usado_gb = disco_usado / (1024 ** 3)
     disco_total_gb = disco_total / (1024 ** 3)
 
@@ -176,7 +172,6 @@ def disco_use(disco, disco_total):
         )
 
 
-# Mostra um título dentro de uma caixa, como no visual original.
 def mostrar_titulo(titulo):
     print("\n    +" + "-" * 60 + "+")
     # center coloca o título no meio dos 60 espaços da caixa.
@@ -184,9 +179,7 @@ def mostrar_titulo(titulo):
     print("    +" + "-" * 60 + "+")
 
 
-# Mostra o cabeçalho e o menu com as bordas do código anterior.
 def mostrar_menu():
-    # As três aspas permitem escrever o quadro em várias linhas.
     print("""
     
         █████╗ ██╗██████╗ ██████╗ ██╗   ██╗██╗     ███████╗███████╗
@@ -218,7 +211,8 @@ def mostrar_menu():
 def escolher_arquivo(arquivos):
     mostrar_titulo("ARQUIVOS DISPONÍVEIS")
 
-    # Este for está dentro da função: quatro espaços antes dele.
+    # Este for está dentro da função: quatro espaços antes dele. 
+    #Não entendi oq significa então não vou alterar esse comentário
     for numero, nome_arquivo in enumerate(arquivos, start=1):
         print(f"        [{numero}] {nome_arquivo}")
 
@@ -260,13 +254,12 @@ def processar_dados(arquivos):
     +------------------------------------------------------------+
 """)
 
-    # Percorre cada arquivo encontrado.
+    # Percorre cada arquivo.
     for nome_arquivo in arquivos:
 
         print(f"\n    Arquivo: {nome_arquivo}")
 
         # Abre o arquivo para leitura.
-        # UTF-8 é a codificação usada para interpretar o texto.
         # O with fecha o arquivo automaticamente ao sair do bloco.
         with open(
             nome_arquivo,
@@ -275,25 +268,22 @@ def processar_dados(arquivos):
             newline=""
         ) as arquivo:
 
-            # Usa a primeira linha como cabeçalho.
             # Cada registro é lido como um dicionário:
-            # o nome da coluna é a chave e o conteúdo é o valor.
             leitor = csv.DictReader(arquivo)
 
-            # Percorre os registros do arquivo, sem incluir o cabeçalho.
             for linha in leitor:
 
                 # Pega o conteúdo da coluna username.
                 username = linha["username"]
 
                 # Transforma a data escrita no CSV em um objeto datetime.
-                # O formato esperado é ano-mês-dia hora:minuto:segundo.
+                # O formato é ano-mês-dia hora:minuto:segundo
                 timestamp = datetime.strptime(
                     linha["timestamp"],
                     "%Y-%m-%d %H:%M:%S"
                 )
 
-                # Os valores do CSV chegam como texto.
+                
                 # float converte esses valores para números decimais.
                 cpu = float(linha["cpu"])
                 ram = float(linha["ram"])
@@ -301,17 +291,15 @@ def processar_dados(arquivos):
                 disco = float(linha["disco"])
                 disco_total = float(linha["disco_total"])
 
-                # += soma o novo valor ao que já estava na variável.
+        
                 soma_cpu += cpu
                 soma_ram += ram
                 soma_disco += disco
 
-                # Conta mais um registro processado.
+        
                 quantidade_registros += 1
 
                 # Mostra os dados do registro atual.
-                # \n pula uma linha.
-                # strftime formata a data para dia/mês/ano hora:minuto:segundo.
                 print(
                     "\n"
                     "==============================================================\n"
@@ -324,7 +312,6 @@ def processar_dados(arquivos):
                     "=============================================================="
                 )
 
-                # Chama cada função com os valores do registro atual.
                 print("\n[ CPU ]")
                 cpu_use(cpu)
 
@@ -380,7 +367,6 @@ def processar_dados(arquivos):
 def iniciar():
     while True:
         mostrar_menu()
-        # \n pula uma linha; input recebe texto; strip remove espaços das pontas.
         opcao = input("\nEscolha uma opção: ").strip()
 
         if opcao == "0":
