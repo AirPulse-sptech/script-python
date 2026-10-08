@@ -1,21 +1,41 @@
+# AirPulse â€” Python
 
-Load
-```
+RepositÃ³rio responsÃ¡vel pelos cÃ³digos Python do projeto AirPulse.
 
-Cada etapa tem uma responsabilidade espec¡fica e deve evitar misturar fun‡äes de outras etapas.
+O objetivo deste repositÃ³rio Ã© cuidar da **simulaÃ§Ã£o, coleta, tratamento e carga dos dados de telemetria** usados nas anÃ¡lises.
 
 ---
 
-## 1. Simula‡Æo
+## Estrutura do fluxo
 
-**Responsabilidade:** gerar dados que representem o comportamento de um FMC durante uma sessÆo de voo.
+```text
+SimulaÃ§Ã£o
+   â†“
+Agente
+   â†“
+Bronze
+   â†“
+Tratamento
+   â†“
+Silver / Gold
+   â†“
+Load
+```
 
-O c¢digo de simula‡Æo deve:
+Cada etapa tem uma responsabilidade especÃ­fica e deve evitar misturar funÃ§Ãµes de outras etapas.
+
+---
+
+## 1. SimulaÃ§Ã£o
+
+**Responsabilidade:** gerar dados que representem o comportamento de um FMC durante uma sessÃ£o de voo.
+
+O cÃ³digo de simulaÃ§Ã£o deve:
 
 * representar as fases do voo;
-* gerar varia‡äes de CPU, mem¢ria e I/O;
-* criar cen rios normais e de degrada‡Æo;
-* gerar dados em uma sequˆncia temporal;
+* gerar variaÃ§Ãµes de CPU, memÃ³ria e I/O;
+* criar cenÃ¡rios normais e de degradaÃ§Ã£o;
+* gerar dados em uma sequÃªncia temporal;
 * salvar os dados para serem usados pelo agente/tratamento.
 
 Exemplo:
@@ -24,24 +44,24 @@ Exemplo:
 simulacao_voo.py
 ```
 
-Os valores gerados pela simula‡Æo sÆo **sint‚ticos**. Eles servem para testar o pipeline e reproduzir cen rios de degrada‡Æo de forma controlada.
+Os valores gerados pela simulaÃ§Ã£o sÃ£o **sintÃ©ticos**. Eles servem para testar o pipeline e reproduzir cenÃ¡rios de degradaÃ§Ã£o de forma controlada.
 
 ---
 
 ## 2. Agente
 
-**Responsabilidade:** coletar a telemetria do ambiente de execu‡Æo.
+**Responsabilidade:** coletar a telemetria do ambiente de execuÃ§Ã£o.
 
 O agente deve:
 
-* coletar as m‚tricas do computador;
+* coletar as mÃ©tricas do computador;
 * registrar o timestamp;
 * identificar a origem da coleta;
-* coletar CPU, mem¢ria, I/O e uptime;
-* manter a frequˆncia de coleta definida;
+* coletar CPU, memÃ³ria, I/O e uptime;
+* manter a frequÃªncia de coleta definida;
 * gerar/enviar os dados para a camada Bronze.
 
-A ideia ‚ que o agente seja respons vel pela **aquisi‡Æo**, e nÆo pela an lise dos dados.
+A ideia Ã© que o agente seja responsÃ¡vel pela **aquisiÃ§Ã£o**, e nÃ£o pela anÃ¡lise dos dados.
 
 ---
 
@@ -49,7 +69,7 @@ A ideia ‚ que o agente seja respons vel pela **aquisi‡Æo**, e nÆo pela an lise d
 
 **Responsabilidade:** armazenar os dados brutos coletados pelo agente.
 
-Os dados devem permanecer pr¢ximos do formato original, evitando transforma‡äes desnecess rias nessa etapa.
+Os dados devem permanecer prÃ³ximos do formato original, evitando transformaÃ§Ãµes desnecessÃ¡rias nessa etapa.
 
 Exemplo:
 
@@ -62,27 +82,27 @@ A Bronze deve facilitar:
 * rastreabilidade;
 * reprocessamento;
 * auditoria;
-* recupera‡Æo dos dados originais.
+* recuperaÃ§Ã£o dos dados originais.
 
 ---
 
 ## 4. Tratamento
 
-**Responsabilidade:** transformar os dados brutos em dados prontos para an lise.
+**Responsabilidade:** transformar os dados brutos em dados prontos para anÃ¡lise.
 
 O tratamento deve:
 
 * limpar e organizar os dados;
 * corrigir tipos;
-* calcular m‚tricas derivadas;
+* calcular mÃ©tricas derivadas;
 * calcular taxas de I/O;
-* calcular m‚tricas de mem¢ria;
+* calcular mÃ©tricas de memÃ³ria;
 * identificar lacunas na coleta;
-* identificar condi‡äes de CPU;
-* separar os dados por sessÆo/fase de voo;
+* identificar condiÃ§Ãµes de CPU;
+* separar os dados por sessÃ£o/fase de voo;
 * gerar os resultados das camadas Silver e Gold.
 
-Entre as m‚tricas utilizadas estÆo:
+Entre as mÃ©tricas utilizadas estÃ£o:
 
 ```text
 cpu_media
@@ -103,138 +123,66 @@ health_score
 flash_autonomia_h
 ```
 
-Os c lculos e limiares devem seguir a fundamenta‡Æo te¢rica do projeto.
+Os cÃ¡lculos e limiares devem seguir a fundamentaÃ§Ã£o teÃ³rica do projeto.
 
 ---
 
-## 5. Detec‡Æo de alertas
+## 5. DetecÃ§Ã£o de alertas
 
-A etapa de tratamento tamb‚m deve identificar condi‡äes de:
+A etapa de tratamento tambÃ©m deve identificar condiÃ§Ãµes de:
 
 ```text
 Normal
-Aten‡Æo
-Cr¡tico
+AtenÃ§Ã£o
+CrÃ­tico
 ```
 
-Para evitar falsos alarmes, o processamento utiliza conceitos de **persistˆncia** e **histerese**.
+Para evitar falsos alarmes, o processamento utiliza conceitos de **persistÃªncia** e **histerese**.
 
-Na configura‡Æo documentada na fundamenta‡Æo:
+Na configuraÃ§Ã£o documentada na fundamentaÃ§Ã£o:
 
-
-Banco / Data Lake / destino final
-```
-
-A ideia ‚ manter **tratamento** e **persistˆncia** separados.
-
----
-
-## 9. Organiza‡Æo recomendada
-
-```text
-/
-ÃÄÄ simulacao/
-³   ÀÄÄ simulacao_voo.py
-³
-ÃÄÄ agente/
-³   ÀÄÄ agente.py
-³
-ÃÄÄ tratamento/
-³   ÀÄÄ tratamento.py
-³
-ÃÄÄ load/
-³   ÀÄÄ load.py
-³
-ÃÄÄ dados/
-³   ÃÄÄ bronze/
-³   ÃÄÄ silver/
-³   ÀÄÄ gold/
-³
-ÀÄÄ README.md
-```
-
-Os nomes e pastas podem mudar conforme a implementa‡Æo, mas a separa‡Æo das responsabilidades deve ser mantida.
-
----
-
-## 10. Rela‡Æo com a fundamenta‡Æo te¢rica
-
-As decisäes de tratamento e as principais m‚tricas do c¢digo sÆo baseadas na fundamenta‡Æo te¢rica do projeto, especialmente nos conceitos de:
-
-* ISO 13374;
-* ARINC 653;
-* DO-178C;
-* Rate Monotonic Scheduling;
-* teoria de filas;
-* Software Aging;
-* regressÆo linear;
-* RUL;
-* Arrhenius;
-* persistˆncia e histerese.
-
-A fundamenta‡Æo completa est  no documento:
-
-**Fundamenta‡Æo Te¢rica e Comprova‡Æo Cient¡fica das M‚tricas de Telemetria e KPIs em Sistemas Avi“nicos (PHM).**
-
----
-
-## 11. Regra principal deste reposit¢rio
-
-Cada c¢digo deve ter uma responsabilidade clara:
-
-```text
-Simula‡Æo  gerar
-Agente     coletar
-Bronze     armazenar bruto
-Tratamento  transformar e analisar
-Load       carregar
-```
-
-Isso mant‚m o pipeline organizado e facilita testes, manuten‡Æo e reprocessamento.
 ```text
 PERSISTENCIA_AMOSTRAS = 3
 HISTERESE_PTS = 5.0
 ```
 
-Tamb‚m sÆo consideradas condi‡äes de qualidade dos dados, como lacunas na sequˆncia de coleta.
+TambÃ©m sÃ£o consideradas condiÃ§Ãµes de qualidade dos dados, como lacunas na sequÃªncia de coleta.
 
 ---
 
-## 6. Health Score e progn¢stico
+## 6. Health Score e prognÃ³stico
 
-Depois do tratamento das m‚tricas, o c¢digo pode consolidar os resultados em indicadores de sa£de.
+Depois do tratamento das mÃ©tricas, o cÃ³digo pode consolidar os resultados em indicadores de saÃºde.
 
 ### Health Score
 
-O `health_score` re£ne diferentes indicadores em uma pontua‡Æo £nica.
+O `health_score` reÃºne diferentes indicadores em uma pontuaÃ§Ã£o Ãºnica.
 
-A l¢gica utiliza penaliza‡äes diferentes para situa‡äes de aten‡Æo e situa‡äes cr¡ticas.
+A lÃ³gica utiliza penalizaÃ§Ãµes diferentes para situaÃ§Ãµes de atenÃ§Ã£o e situaÃ§Ãµes crÃ­ticas.
 
-### Tendˆncia de mem¢ria
+### TendÃªncia de memÃ³ria
 
-A m‚trica:
+A mÃ©trica:
 
-
-     Load
-      ```text
+```text
 ram_tendencia_kb_h
 ```
 
-‚ obtida por regressÆo linear e representa a tendˆncia de crescimento da mem¢ria ao longo da sessÆo.
+Ã© obtida por regressÃ£o linear e representa a tendÃªncia de crescimento da memÃ³ria ao longo da sessÃ£o.
 
 ### RUL da Flash
 
-A m‚trica:
+A mÃ©trica:
 
 ```text
 flash_autonomia_h
 ```
 
-‚ uma estimativa de autonomia baseada na taxa de utiliza‡Æo observada.
+Ã© uma estimativa de autonomia baseada na taxa de utilizaÃ§Ã£o observada.
 
 ---
 
-## 7. Arquivos de sa¡da
+## 7. Arquivos de saÃ­da
 
 Os resultados tratados podem gerar arquivos como:
 
@@ -244,38 +192,89 @@ gold_resumo_fmc.csv
 gold_kpi_fase.csv
 ```
 
-Esses arquivos representam os dados j  preparados para consumo pelas pr¢ximas partes do projeto.
+Esses arquivos representam os dados jÃ¡ preparados para consumo pelas prÃ³ximas partes do projeto.
 
 ---
 
 ## 8. Load
 
-**Responsabilidade:** pegar os dados tratados e carreg -los no destino definido pelo projeto.
+**Responsabilidade:** pegar os dados tratados e carregÃ¡-los no destino definido pelo projeto.
 
-O load nÆo deve refazer os c lculos do tratamento.
+O load nÃ£o deve refazer os cÃ¡lculos do tratamento.
 
 Fluxo:
 
 ```text
 Dados tratados
-      
-Silver / Gold
-   
-Tratamento
-   
-Bronze
-   
-Agente
-   # AirPulse - Python
+      â†“
+     Load
+      â†“
+Banco / Data Lake / destino final
+```
 
-Reposit¢rio respons vel pelos c¢digos Python do projeto AirPulse.
-
-O objetivo deste reposit¢rio ‚ cuidar da **simula‡Æo, coleta, tratamento e carga dos dados de telemetria** usados nas an lises.
+A ideia Ã© manter **tratamento** e **persistÃªncia** separados.
 
 ---
 
-## Estrutura do fluxo
+## 9. OrganizaÃ§Ã£o recomendada
 
 ```text
-Simula‡Æo
-   
+/
+â”œâ”€â”€ simulacao/
+â”‚   â””â”€â”€ simulacao_voo.py
+â”‚
+â”œâ”€â”€ agente/
+â”‚   â””â”€â”€ agente.py
+â”‚
+â”œâ”€â”€ tratamento/
+â”‚   â””â”€â”€ tratamento.py
+â”‚
+â”œâ”€â”€ load/
+â”‚   â””â”€â”€ load.py
+â”‚
+â”œâ”€â”€ dados/
+â”‚   â”œâ”€â”€ bronze/
+â”‚   â”œâ”€â”€ silver/
+â”‚   â””â”€â”€ gold/
+â”‚
+â””â”€â”€ README.md
+```
+
+Os nomes e pastas podem mudar conforme a implementaÃ§Ã£o, mas a separaÃ§Ã£o das responsabilidades deve ser mantida.
+
+---
+
+## 10. RelaÃ§Ã£o com a fundamentaÃ§Ã£o teÃ³rica
+
+As decisÃµes de tratamento e as principais mÃ©tricas do cÃ³digo sÃ£o baseadas na fundamentaÃ§Ã£o teÃ³rica do projeto, especialmente nos conceitos de:
+
+* ISO 13374;
+* ARINC 653;
+* DO-178C;
+* Rate Monotonic Scheduling;
+* teoria de filas;
+* Software Aging;
+* regressÃ£o linear;
+* RUL;
+* Arrhenius;
+* persistÃªncia e histerese.
+
+A fundamentaÃ§Ã£o completa estÃ¡ no documento:
+
+**FundamentaÃ§Ã£o TeÃ³rica e ComprovaÃ§Ã£o CientÃ­fica das MÃ©tricas de Telemetria e KPIs em Sistemas AviÃ´nicos (PHM).**
+
+---
+
+## 11. Regra principal deste repositÃ³rio
+
+Cada cÃ³digo deve ter uma responsabilidade clara:
+
+```text
+SimulaÃ§Ã£o â†’ gerar
+Agente    â†’ coletar
+Bronze    â†’ armazenar bruto
+Tratamento â†’ transformar e analisar
+Load      â†’ carregar
+```
+
+Isso mantÃ©m o pipeline organizado e facilita testes, manutenÃ§Ã£o e reprocessamento.
