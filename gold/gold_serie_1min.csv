@@ -1,0 +1,3 @@
+empresa_id;aeronave_id;fmc_id;fmc_tipo;placa_id;origem;hostname;sessao;fase;ts;amostras;cpu_media;ram_media;flash_media;temp_media;temp_max;lacunas
+EMP-01;PR-XYZ;FMC-01;principal;1;SIMULADA_BANCADA;Fonte;1;PREFLIGHT;2026-10-10 20:29:00+00:00;1;29.562;13.153;1.724;49.8;49.8;0
+EMP-01;PR-XYZ;FMC-01;principal;1;SIMULADA_BANCADA;Fonte;1;PREFLIGHT;2026-10-10 20:30:00+00:00;5;29.648;13.153;4.289;49.82;49.9;0

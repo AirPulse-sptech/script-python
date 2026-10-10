@@ -1,0 +1,1 @@
+empresa_id;aeronave_id;fmc_id;fmc_tipo;placa_id;origem;hostname;sessao;alerta_id;metrica;tipo_evento;nivel;valor;limiar_violado;ts_abertura;ts_evento;ts_encerramento;duracao_s;fase;fase_evento;em_aberto_apos_evento
