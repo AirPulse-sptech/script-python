@@ -1,17 +1,12 @@
-"""ETL AirPulse: Bronze -> Silver -> Gold.
+# ETL AirPulse: Bronze -> Silver -> Gold usando o esquema do agente atual.
+#
+# O agente fornece timestamps, o hostname (= computador.nome no cadastro), CPU normalizada para o
+# host, métricas de RAM/Flash, fase, intervalo de coleta e contadores de I/O com
+# unidades explícitas. Este pipeline não reconstrói métricas a partir de colunas
+# antigas: quando uma medição canônica estiver ausente, ela permanece desconhecida.
 
-Contrato novo do Bronze:
-- ``fase`` e ``sessao_origem`` identificam o estado da fonte quando disponíveis;
-- ``intervalo_coleta_s`` registra a cadência prevista da origem;
-- ``cpu_pct_host`` é CPU normalizada para a capacidade do host (0..100);
-- contadores de I/O incluem unidades explícitas (bytes ou chars);
-- temperatura é estimativa sintética, salvo declaração diferente da fonte.
-
-Compatibilidade: colunas do Bronze legado são reconhecidas quando a origem e a
-semântica podem ser identificadas. Quando isso não é possível, a métrica fica
-indeterminada em vez de se atribuir uma unidade ou fase sem evidência.
-"""
-
+import argparse
+import json
 import os
 from pathlib import Path
 
@@ -25,16 +20,42 @@ load_dotenv()
 # 1. CONFIGURAÇÕES E CONTRATOS
 # ============================================================
 
-ARQUIVO_BRONZE = (
-    "bronze_semana.csv" if os.path.exists("bronze_semana.csv") else "bronze_bruto.csv"
-)
+# Se ARQUIVO_BRONZE estiver no .env, usa esse caminho explicitamente.
+# Normalmente o agente grava bronze_ativo.json, dizendo qual Bronze acabou de gerar.
+# Isso evita que um CSV velho escolha a fonte errada só por ainda existir na pasta.
+ARQUIVO_BRONZE = os.getenv("ARQUIVO_BRONZE")
+ARQUIVO_ESTADO_BRONZE = os.getenv("ARQUIVO_ESTADO_BRONZE", "bronze_ativo.json")
 PASTA_SILVER = Path("silver")
 PASTA_GOLD = Path("gold")
 
-INTERVALO_COLETA_S = max(1, int(os.getenv("INTERVALO_COLETA_S", "10")))
-ACELERADOR_DE_TEMPO = float(os.getenv("ACELERADOR_DE_TEMPO", "10"))
-if ACELERADOR_DE_TEMPO <= 0:
-    raise ValueError("ACELERADOR_DE_TEMPO deve ser maior que zero.")
+
+def selecionar_arquivo_bronze():
+    # Escolhe a fonte indicada pelo agente; mantém fallback para execução manual.
+    if ARQUIVO_BRONZE:
+        return ARQUIVO_BRONZE
+
+    if os.path.exists(ARQUIVO_ESTADO_BRONZE):
+        # Lê o arquivo indicado pelo agente, mesmo que haja outro Bronze antigo.
+        try:
+            with open(ARQUIVO_ESTADO_BRONZE, encoding="utf-8") as arquivo:
+                estado = json.load(arquivo)
+            caminho = estado.get("arquivo_bronze") if isinstance(estado, dict) else None
+        except (OSError, json.JSONDecodeError) as erro:
+            raise SystemExit(f"Não foi possível ler {ARQUIVO_ESTADO_BRONZE}: {erro}") from erro
+        if not caminho:
+            raise SystemExit(f"{ARQUIVO_ESTADO_BRONZE} não informa o arquivo_bronze.")
+        if not os.path.exists(caminho):
+            raise SystemExit(
+                f"O agente indicou '{caminho}' em {ARQUIVO_ESTADO_BRONZE}, mas o arquivo não existe."
+            )
+        return caminho
+
+    # Fallback para CSVs antigos que ainda não têm arquivo de estado.
+    if os.path.exists("bronze_bruto.csv"):
+        return "bronze_bruto.csv"
+    if os.path.exists("bronze_semana.csv"):
+        return "bronze_semana.csv"
+    return "bronze_bruto.csv"
 
 # nome, duração em minutos simulados, CPU esperada, RAM esperada
 FASES_VOO = [
@@ -60,27 +81,57 @@ PESO_CRITICO = 2.0
 PENALIDADE_COMPLETUDE_POR_PONTO = 0.3
 MIN_AMOSTRAS_HEALTH = 3  # Decisão conservadora de implementação; não é requisito textual.
 
-CHAVES_BASE = [
-    "empresa_id", "aeronave_id", "fmc_id", "fmc_tipo", "placa_id", "origem", "hostname",
-]
+# A identidade do equipamento é só o hostname (= computador.nome cadastrado pelo gestor).
+# Empresa, aeronave e placas são resolvidas depois, por join com o cadastro.
+CHAVES_BASE = ["hostname"]
 CHAVES_AGRUPAMENTO = CHAVES_BASE + ["sessao"]
-CHAVES_FMC = ["empresa_id", "aeronave_id", "fmc_id", "fmc_tipo", "placa_id"]
+CHAVES_FMC = ["hostname"]
 
 BYTES_POR_KB = 1024
-BYTES_POR_MB = 1024 * 1024
-METRICAS_ALERTAVEIS = ("cpu_pct", "ram_pct", "flash_pct", "temp_c")
+METRICAS_ALERTAVEIS = ("cpu_pct", "ram_pct", "flash_pct")
 
 
 # ============================================================
-# 2. LIMIARES OPCIONAIS DO MYSQL
+# 2. CADASTRO DO MYSQL: hostname -> computador -> aeronave -> empresa (+ placas e limites)
 # ============================================================
 
-def carregar_limiares_do_banco() -> dict:
-    """Carrega limites configurados; apenas CPU tem padrão documentado no projeto."""
+# Premissa do projeto: computador.nome é o hostname da máquina e é único.
+COLUNAS_CADASTRO = [
+    "computador_id", "tipo_fmc", "status_computador",
+    "aeronave_id", "aeronave_nome", "aeronave_modelo", "companhia_aerea",
+    "empresa_id", "empresa_nome",
+]
+MAPA_TIPO_METRICA = {"CPU": "cpu_pct", "RAM": "ram_pct", "DISCO": "flash_pct", "FLASH": "flash_pct"}
+
+SQL_CADASTRO = (
+    "SELECT c.nome, c.idComputador, c.tipoFmc, c.statusComputador, "
+    "a.idAeronave, a.nome, a.modelo, a.companhiaAerea, "
+    "e.idEmpresaFabricante, COALESCE(NULLIF(e.nomeFantasia, ''), e.razaoSocial) "
+    "FROM computador c "
+    "JOIN aeronave a ON a.idAeronave = c.fkAeronave "
+    "JOIN empresaFabricante e ON e.idEmpresaFabricante = a.fkEmpresaFabricante"
+)
+SQL_COMPONENTES = (
+    "SELECT c.nome, co.idComponente, co.tipo, p.idPlaca, p.nome, "
+    "co.limiteAtencao, co.limiteCritico "
+    "FROM componente co "
+    "JOIN placa p ON p.idPlaca = co.fkPlaca "
+    "JOIN computador c ON c.idComputador = p.fkComputador "
+    "WHERE co.statusMonitoramento = 'ATIVO'"
+)
+
+
+def _chave_hostname(serie: pd.Series) -> pd.Series:
+    # Compara hostnames sem diferenciar maiúsculas/minúsculas (Windows costuma devolver em MAIÚSCULAS).
+    return serie.astype(str).str.strip().str.lower()
+
+
+def carregar_cadastro_do_banco():
+    # Devolve (df_cadastro, df_componentes). Se o banco não responder, devolve (None, None):
+    # o pipeline continua por hostname, só que sem empresa/aeronave e com os limites padrão.
     conexao = None
-    limiares = dict(LIMITES_PADRAO)
     try:
-        import pymysql  # Importação tardia; MySQL continua opcional.
+        import pymysql  # Importação tardia; MySQL continua opcional para testes locais.
 
         conexao = pymysql.connect(
             host=os.getenv("DB_HOST", "localhost"),
@@ -91,36 +142,95 @@ def carregar_limiares_do_banco() -> dict:
             connect_timeout=5,
         )
         with conexao.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT tipo, AVG(limiteAtencao), AVG(limiteCritico)
-                FROM componente
-                WHERE statusMonitoramento = 'ATIVO'
-                GROUP BY tipo
-                """
-            )
-            resultados = cursor.fetchall()
-
-        mapa_metricas = {
-            "CPU": "cpu_pct", "RAM": "ram_pct", "DISCO": "flash_pct",
-            "FLASH": "flash_pct", "TEMPERATURA": "temp_c",
-        }
-        for tipo, atencao, critico in resultados:
-            metrica = mapa_metricas.get(str(tipo).upper())
-            if not metrica or atencao is None or critico is None:
-                continue
-            atencao, critico = float(atencao), float(critico)
-            if not np.isfinite(atencao) or not np.isfinite(critico) or atencao >= critico:
-                print(f"Limiares inválidos para {tipo}; configuração ignorada.")
-                continue
-            limiares[metrica] = (atencao, critico)
-        print(f"Limiares de monitoramento carregados: {limiares}")
+            cursor.execute(SQL_CADASTRO)
+            linhas_cadastro = cursor.fetchall()
+            cursor.execute(SQL_COMPONENTES)
+            linhas_componentes = cursor.fetchall()
     except Exception as erro:
-        print(f"MySQL indisponível ({erro}); usando limites disponíveis no código: {limiares}")
+        print(f"MySQL indisponível ({erro}); seguindo só por hostname, com limites padrão.")
+        return None, None
     finally:
         if conexao is not None:
             conexao.close()
-    return limiares
+
+    cadastro = pd.DataFrame(linhas_cadastro, columns=["hostname", *COLUNAS_CADASTRO])
+    for coluna in ("computador_id", "aeronave_id", "empresa_id"):
+        cadastro[coluna] = cadastro[coluna].astype("Int64")
+
+    componentes = pd.DataFrame(linhas_componentes, columns=[
+        "hostname", "componente_id", "tipo", "placa_id", "placa_nome", "limiteAtencao", "limiteCritico",
+    ])
+    componentes["metrica"] = componentes["tipo"].astype(str).str.upper().map(MAPA_TIPO_METRICA)
+    componentes = componentes.dropna(subset=["metrica"]).reset_index(drop=True)
+    for coluna in ("limiteAtencao", "limiteCritico"):
+        componentes[coluna] = pd.to_numeric(componentes[coluna], errors="coerce")
+
+    print(f"Cadastro carregado: {len(cadastro)} computador(es), {len(componentes)} componente(s) ativo(s).")
+    return cadastro, componentes
+
+
+def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame:
+    # Liga cada amostra ao cadastro pelo hostname e traz os limites de cada computador.
+    df["_chave_host"] = _chave_hostname(df["hostname"])
+
+    if cadastro is None:
+        for coluna in COLUNAS_CADASTRO:
+            df[coluna] = np.nan
+        # Sem banco não dá para saber se o hostname existe: fica desconhecido, não "falso".
+        df["q_hostname_nao_cadastrado"] = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    else:
+        ref = cadastro.assign(_chave_host=_chave_hostname(cadastro["hostname"])).drop(columns="hostname")
+        duplicados = ref["_chave_host"].duplicated(keep="first")
+        if duplicados.any():
+            print("Aviso: hostnames repetidos no cadastro (a premissa é nome único): "
+                  + ", ".join(sorted(ref.loc[duplicados, "_chave_host"].unique())))
+            ref = ref[~duplicados]
+        df = df.merge(ref, on="_chave_host", how="left")
+        df["q_hostname_nao_cadastrado"] = df["computador_id"].isna()
+
+    # Limites por computador (cadastrados pelo gestor); CPU cai no padrão documentado se faltar.
+    for metrica in METRICAS_ALERTAVEIS:
+        df[f"limiar_{metrica}_atencao"] = np.nan
+        df[f"limiar_{metrica}_critico"] = np.nan
+    if componentes is not None and not componentes.empty:
+        lim = componentes.assign(_chave_host=_chave_hostname(componentes["hostname"]))
+        for metrica in METRICAS_ALERTAVEIS:
+            do_host = lim[lim["metrica"] == metrica].groupby("_chave_host")[["limiteAtencao", "limiteCritico"]].mean()
+            df[f"limiar_{metrica}_atencao"] = pd.to_numeric(df["_chave_host"].map(do_host["limiteAtencao"]), errors="coerce")
+            df[f"limiar_{metrica}_critico"] = pd.to_numeric(df["_chave_host"].map(do_host["limiteCritico"]), errors="coerce")
+    for metrica, (padrao_atencao, padrao_critico) in LIMITES_PADRAO.items():
+        sem_limite = df[f"limiar_{metrica}_atencao"].isna() | df[f"limiar_{metrica}_critico"].isna()
+        df.loc[sem_limite, f"limiar_{metrica}_atencao"] = padrao_atencao
+        df.loc[sem_limite, f"limiar_{metrica}_critico"] = padrao_critico
+    for metrica in METRICAS_ALERTAVEIS:
+        colunas = [f"limiar_{metrica}_atencao", f"limiar_{metrica}_critico"]
+        invalido = ~(df[colunas[0]] < df[colunas[1]])  # também pega NaN
+        df.loc[invalido, colunas] = np.nan
+    return df
+
+
+def anexar_cadastro(df_gold: pd.DataFrame, df_silver: pd.DataFrame) -> pd.DataFrame:
+    # Coloca empresa/aeronave/computador (vindos do Silver) nas tabelas Gold, pelo hostname.
+    if df_gold.empty:
+        return df_gold
+    ref = df_silver[["hostname", *COLUNAS_CADASTRO]].drop_duplicates("hostname")
+    saida = df_gold.merge(ref, on="hostname", how="left")
+    primeiras = ["hostname", *COLUNAS_CADASTRO]
+    return saida[primeiras + [c for c in saida.columns if c not in primeiras]]
+
+
+def vincular_componente_alertas(df_alertas: pd.DataFrame, componentes) -> pd.DataFrame:
+    # Liga cada alerta ao componente e à placa monitorados (cpu->CPU, ram->RAM, flash->DISCO).
+    novas = ["componente_id", "placa_id", "placa_nome"]
+    if componentes is None or componentes.empty or df_alertas.empty:
+        for coluna in novas:
+            df_alertas[coluna] = np.nan
+        return df_alertas
+    comp = componentes[["hostname", "metrica", *novas]].copy()
+    comp["_chave_host"] = _chave_hostname(comp["hostname"])
+    comp = comp.drop(columns="hostname").drop_duplicates(["_chave_host", "metrica"])
+    saida = df_alertas.assign(_chave_host=_chave_hostname(df_alertas["hostname"]))
+    return saida.merge(comp, on=["_chave_host", "metrica"], how="left").drop(columns="_chave_host")
 
 
 def _garantir_coluna(df: pd.DataFrame, nome: str, valor_padrao=np.nan) -> None:
@@ -128,50 +238,9 @@ def _garantir_coluna(df: pd.DataFrame, nome: str, valor_padrao=np.nan) -> None:
         df[nome] = valor_padrao
 
 
-def _numero_positivo(valor) -> bool:
-    try:
-        return bool(np.isfinite(float(valor)) and float(valor) > 0)
-    except (TypeError, ValueError):
-        return False
-
-
-def _inferir_fase_legacy(linha: pd.Series) -> str:
-    """Fallback somente para telemetria legada da bancada com uptime e fator válidos."""
-    if str(linha.get("origem", "")).upper() != "SIMULADA_BANCADA":
-        return "NAO_DETERMINADA"
-    uptime = linha.get("uptime_proc_s")
-    fator = linha.get("fator_tempo")
-    if pd.isna(uptime) or not _numero_positivo(fator) or not np.isfinite(float(uptime)):
-        return "NAO_DETERMINADA"
-    tempo_simulado_s = max(0.0, float(uptime)) * float(fator)
-    limites_s = np.cumsum([minutos * 60 for _, minutos, _, _ in FASES_VOO])
-    if tempo_simulado_s >= limites_s[-1]:
-        return "NAO_DETERMINADA"
-    indice = int(np.searchsorted(limites_s, tempo_simulado_s, side="right"))
-    return FASES_VOO[indice][0]
-
-
-def _unidade_io_legada(df: pd.DataFrame, tipo: str, coluna_origem: str | None) -> pd.Series:
-    """Infere bytes apenas quando a fonte permite; legado de bancada fica desconhecido."""
-    origem = df["origem"].fillna("").astype(str).str.upper()
-    unidade = pd.Series("desconhecida", index=df.index, dtype="object")
-    if f"io_{tipo}_unidade" in df.columns:
-        fornecida = df[f"io_{tipo}_unidade"].astype("string").str.lower()
-        permitidas = fornecida.isin(["bytes", "chars"])
-        unidade.loc[permitidas] = fornecida.loc[permitidas].astype(str)
-    else:
-        unidade.loc[origem.eq("SIMULADA_GERADOR")] = "bytes"
-        if coluna_origem == f"io_{tipo}_bytes":
-            # Esse nome não é suficiente para o antigo agente de bancada, que usava chars.
-            unidade.loc[~origem.eq("SIMULADA_BANCADA")] = "bytes"
-    unidade.loc[origem.eq("SIMULADA_BANCADA") & ~df.get(
-        f"io_{tipo}_unidade", pd.Series(index=df.index, dtype="object")
-    ).astype("string").str.lower().isin(["bytes", "chars"])] = "desconhecida"
-    return unidade
-
 
 def _inferir_intervalo(grupo: pd.DataFrame) -> tuple[float, str]:
-    """Usa metadado consistente; sem metadado exige cadência repetida nos timestamps."""
+    # Usa metadado consistente; sem metadado exige cadência repetida nos timestamps.
     if "intervalo_coleta_s" in grupo.columns:
         valores = pd.to_numeric(grupo["intervalo_coleta_s"], errors="coerce")
         valores = valores[np.isfinite(valores) & (valores > 0)].round(6).unique()
@@ -196,24 +265,28 @@ def _inferir_intervalo(grupo: pd.DataFrame) -> tuple[float, str]:
 # 3. BRONZE -> SILVER: VALIDAÇÃO, TIPAGEM, QUALIDADE E DERIVAÇÕES
 # ============================================================
 
-def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = None) -> pd.DataFrame:
-    """Transforma Bronze sem preencher métricas/identidades desconhecidas com valores falsos."""
+def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=None) -> pd.DataFrame:
+    # Transforma Bronze sem preencher métricas/identidades desconhecidas com valores falsos.
     if not isinstance(df_bronze, pd.DataFrame):
         raise TypeError("Bronze deve ser um pandas.DataFrame.")
     if df_bronze.empty:
         raise ValueError("O Bronze não contém amostras.")
 
     df = df_bronze.copy()
-    obrigatorias = ["timestamp_utc", "fmc_id", "aeronave_id", "cpu_percent"]
+    # São os campos mínimos para ordenar as amostras, identificar o FMC e medir CPU.
+    # cpu_percent fica como dado bruto; os cálculos usam cpu_pct_host já normalizado.
+    obrigatorias = ["timestamp_utc", "hostname", "cpu_pct_host"]
     faltantes = [coluna for coluna in obrigatorias if coluna not in df.columns]
     if faltantes:
         raise ValueError("Colunas obrigatórias ausentes no Bronze: " + ", ".join(faltantes))
 
+    # Converte o timestamp para data/hora UTC; texto inválido vira NaT.
+    # Depois remove só as amostras sem horário válido para não quebrar a ordenação temporal.
     df["ts"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["ts"]).copy()
     if df.empty:
         raise ValueError("Nenhuma amostra tem timestamp_utc válido; Bronze foi preservado sem alteração.")
-    for coluna in ("fmc_id", "aeronave_id"):
+    for coluna in ("hostname",):
         if df[coluna].isna().any() or df[coluna].astype(str).str.strip().eq("").any():
             quantidade = int((df[coluna].isna() | df[coluna].astype(str).str.strip().eq("")).sum())
             raise ValueError(
@@ -229,6 +302,7 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
     df["fase"] = df["fase"].astype("object")
     _garantir_coluna(df, "modo_execucao", "desconhecido")
     _garantir_coluna(df, "intervalo_coleta_s", np.nan)
+    _garantir_coluna(df, "cpu_percent", np.nan)  # Mantém a leitura bruta para auditoria.
     _garantir_coluna(df, "cpu_nucleos", np.nan)
     _garantir_coluna(df, "cpu_semantica", np.nan)
     _garantir_coluna(df, "cpu_pct_host", np.nan)
@@ -240,70 +314,41 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
     _garantir_coluna(df, "ram_medicao_tipo", np.nan)
     _garantir_coluna(df, "flash_usada_bytes", np.nan)
     _garantir_coluna(df, "flash_total_bytes", np.nan)
-    _garantir_coluna(df, "temperatura_c", np.nan)
-    _garantir_coluna(df, "temperatura_tipo", np.nan)
-    df["temperatura_tipo"] = df["temperatura_tipo"].astype("object")
     _garantir_coluna(df, "uptime_proc_s", np.nan)
     _garantir_coluna(df, "fator_tempo", np.nan)
     _garantir_coluna(df, "seq", np.nan)
     _garantir_coluna(df, "qtd_tarefas", np.nan)
 
+    # Converte as colunas numéricas de uma vez; texto que não virar número fica como NaN.
+    # Isso evita que uma única string inválida interrompa o processamento inteiro.
     colunas_numericas = [
         "seq", "uptime_proc_s", "fator_tempo", "cpu_percent", "cpu_nucleos", "cpu_pct_host",
         "ram_usada_bytes", "ram_baseline_bytes", "ram_total_bytes", "ram_disponivel_bytes", "flash_usada_bytes",
-        "flash_total_bytes", "temperatura_c", "qtd_tarefas", "intervalo_coleta_s",
+        "flash_total_bytes", "qtd_tarefas", "intervalo_coleta_s",
     ]
     for coluna in colunas_numericas:
         df[coluna] = pd.to_numeric(df[coluna], errors="coerce")
+    # Número de núcleos precisa ser positivo; zero ou negativo não é um valor válido.
     df["cpu_nucleos"] = df["cpu_nucleos"].where(df["cpu_nucleos"] > 0)
 
-    # Reconhece nomes antigos sem declarar que read_chars/write_chars são bytes.
-    origem_contador = {}
+    # Trata os contadores de I/O que o agente novo já entrega.
+    # A unidade é necessária para saber se o contador representa bytes ou caracteres.
+    # Se faltar a coluna ou a unidade, o valor fica desconhecido em vez de usar o nome antigo.
     for tipo in ("leitura", "escrita"):
-        canonico = f"io_{tipo}_contador_acum"
-        alternativas = [f"io_{tipo}_bytes", f"io_{tipo}_bytes_acum"]
-        if canonico not in df.columns:
-            coluna_origem = next((col for col in alternativas if col in df.columns), None)
-            origem_contador[tipo] = coluna_origem
-            df[canonico] = df[coluna_origem] if coluna_origem else np.nan
-        else:
-            origem_contador[tipo] = canonico
-        df[canonico] = pd.to_numeric(df[canonico], errors="coerce")
-        unidade_col = f"io_{tipo}_unidade"
-        if unidade_col not in df.columns:
-            df[unidade_col] = _unidade_io_legada(df, tipo, origem_contador[tipo])
-        else:
-            df[unidade_col] = df[unidade_col].fillna("desconhecida").astype(str).str.lower()
-            df.loc[~df[unidade_col].isin(["bytes", "chars"]), unidade_col] = "desconhecida"
+        coluna_contador = f"io_{tipo}_contador_acum"
+        coluna_unidade = f"io_{tipo}_unidade"
+        _garantir_coluna(df, coluna_contador, np.nan)
+        _garantir_coluna(df, coluna_unidade, "desconhecida")
 
-        # Nomes históricos *_bytes_acum só carregam valores se a unidade for bytes comprovados.
-        legado_bytes = f"io_{tipo}_bytes_acum"
-        if legado_bytes not in df.columns:
-            df[legado_bytes] = np.nan
-        df[legado_bytes] = pd.to_numeric(df[legado_bytes], errors="coerce")
-        df[legado_bytes] = df[legado_bytes].where(df[unidade_col].eq("bytes"))
+        # Texto ou valores inválidos viram NaN; não são convertidos em zero.
+        df[coluna_contador] = pd.to_numeric(df[coluna_contador], errors="coerce")
+        df[coluna_unidade] = df[coluna_unidade].fillna("desconhecida").astype(str).str.lower()
+        df.loc[~df[coluna_unidade].isin(["bytes", "chars"]), coluna_unidade] = "desconhecida"
 
-    if "cpu_pct_host" in df.columns:
-        cpu_host_fornecida = pd.to_numeric(df["cpu_pct_host"], errors="coerce")
-    else:
-        cpu_host_fornecida = pd.Series(np.nan, index=df.index)
-
-    cpu_semantica = df["cpu_semantica"].fillna("").astype(str).str.lower()
-    origem_upper = df["origem"].fillna("").astype(str).str.upper()
-    cpu_legacy = pd.Series(np.nan, index=df.index, dtype="float64")
-    soma_por_nucleo = cpu_semantica.eq("soma_percentual_por_nucleo") | origem_upper.eq("SIMULADA_BANCADA")
-    percentual_host = cpu_semantica.isin([
-        "percentual_host_sintetico", "percentual_host", "host_percent",
-    ]) | origem_upper.eq("SIMULADA_GERADOR")
-    cpu_legacy.loc[soma_por_nucleo] = (
-        df.loc[soma_por_nucleo, "cpu_percent"] / df.loc[soma_por_nucleo, "cpu_nucleos"]
-    )
-    cpu_legacy.loc[percentual_host] = df.loc[percentual_host, "cpu_percent"]
-    uma_cpu = df["cpu_nucleos"].eq(1)
-    cpu_legacy.loc[~soma_por_nucleo & ~percentual_host & uma_cpu] = df.loc[
-        ~soma_por_nucleo & ~percentual_host & uma_cpu, "cpu_percent"
-    ]
-    candidato_cpu = cpu_host_fornecida.where(cpu_host_fornecida.notna(), cpu_legacy)
+    # A CPU normalizada vem diretamente do agente.
+    # Não divide de novo por núcleos, porque isso reduziria a CPU duas vezes.
+    # Também não tenta adivinhar a semântica pelo nome da origem.
+    candidato_cpu = pd.to_numeric(df["cpu_pct_host"], errors="coerce")
     df["q_cpu_semantica_indeterminada"] = candidato_cpu.isna()
     df["q_cpu_acima_100"] = candidato_cpu > 100
     df["q_cpu_negativa"] = candidato_cpu < 0
@@ -321,95 +366,74 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
     df["q_ram_baseline_ignorada"] = (
         df["ram_baseline_bytes"].fillna(0).gt(0) & ~baseline_valida
     )
+    # Total igual a zero não pode servir como divisor para calcular percentuais.
     ram_total_valido = df["ram_total_bytes"].where(df["ram_total_bytes"] > 0)
-    # Compatibilidade: somente o gerador semanal antigo permitia derivar a disponibilidade
-    # do valor de RAM sintético (não derivar RAM livre de RSS de um processo real).
-    disponibilidade_legada_semana = (
-        df["ram_disponivel_bytes"].isna()
-        & origem_upper.eq("SIMULADA_GERADOR")
-        & df["ram_usada_bytes"].notna()
-        & ram_total_valido.notna()
-    )
-    df.loc[disponibilidade_legada_semana, "ram_disponivel_bytes"] = (
-        ram_total_valido.loc[disponibilidade_legada_semana]
-        - df.loc[disponibilidade_legada_semana, "ram_usada_bytes"]
-    )
+    # A disponibilidade de RAM precisa vir do agente. Não a calculamos por diferença,
+    # pois RAM usada pode representar RSS do processo e RAM total pode ser a do host.
     df["q_ram_disponivel_invalida"] = (
         df["ram_disponivel_bytes"].notna()
         & ((df["ram_disponivel_bytes"] < 0)
            | (ram_total_valido.notna() & (df["ram_disponivel_bytes"] > ram_total_valido)))
     )
     df["ram_disponivel_bytes"] = df["ram_disponivel_bytes"].where(~df["q_ram_disponivel_invalida"])
+    # Divide a RAM disponível pela capacidade declarada para obter a percentagem livre.
     df["ram_disponivel_pct"] = df["ram_disponivel_bytes"] / ram_total_valido * 100
+    # A Flash também precisa ter capacidade positiva antes de calcular o percentual ocupado.
     flash_total_valido = df["flash_total_bytes"].where(df["flash_total_bytes"] > 0)
     df["ram_pct"] = df["ram_logica_bytes"] / ram_total_valido * 100
     df["flash_pct"] = df["flash_usada_bytes"].where(df["flash_usada_bytes"] >= 0) / flash_total_valido * 100
     df["q_ram_acima_100"] = df["ram_pct"] > 100
     df["q_flash_acima_100"] = df["flash_pct"] > 100
 
-    # Fase explícita é prioritária; fallback é restrito ao legado da bancada.
-    duracoes_permitidas = df["fase"].astype("string").str.strip()
-    fase_ausente = duracoes_permitidas.isna() | duracoes_permitidas.eq("") | duracoes_permitidas.str.upper().eq("NAO_DETERMINADA")
-    if fase_ausente.any():
-        df.loc[fase_ausente, "fase"] = df.loc[fase_ausente].apply(_inferir_fase_legacy, axis=1)
+    # O agente novo grava a fase observada nos metadados da bancada.
+    # Se ela não vier, não tentamos deduzi-la pelo uptime: marcamos como desconhecida.
     df["fase"] = df["fase"].fillna("NAO_DETERMINADA").astype(str).str.strip()
     df.loc[df["fase"].eq(""), "fase"] = "NAO_DETERMINADA"
 
-    # Temperatura sintética comum aos modos: 35 + 0,5 * CPU normalizada para o host.
-    temperatura_estimada = 35.0 + 0.5 * df["cpu_pct"]
-    temperatura_fonte = pd.to_numeric(df["temperatura_c"], errors="coerce")
-    df["temp_c"] = temperatura_fonte.where(temperatura_fonte.notna(), temperatura_estimada)
-    temp_tipo_vazio = df["temperatura_tipo"].isna() | df["temperatura_tipo"].astype(str).str.strip().eq("")
-    simuladas = origem_upper.isin(["SIMULADA_BANCADA", "SIMULADA_GERADOR"])
-    df.loc[temp_tipo_vazio & simuladas, "temperatura_tipo"] = "ESTIMATIVA_SINTETICA_LEGADA"
-    df.loc[temp_tipo_vazio & ~simuladas & temperatura_fonte.isna(), "temperatura_tipo"] = "ESTIMATIVA_SINTETICA_FALLBACK"
-    df.loc[temp_tipo_vazio & ~simuladas & temperatura_fonte.notna(), "temperatura_tipo"] = "ORIGEM_NAO_IDENTIFICADA"
 
-    # State Detection (Silver): níveis e flags usam os limiares desta execução.
-    # Na ausência de configuração explícita, somente CPU recebe os limites documentados.
-    limiares_estado = dict(LIMITES_PADRAO) if limiares is None else dict(limiares)
+    # Liga hostname -> computador/aeronave/empresa e traz os limites de cada computador.
+    df = _vincular_cadastro(df, cadastro, componentes)
+
+    # Compara cada métrica com os limites do próprio computador (cadastrados pelo gestor).
+    # Sem limite configurado, a métrica não recebe estado de alerta inventado.
     for metrica in METRICAS_ALERTAVEIS:
-        nome_nivel = f"nivel_{metrica}"
-        nome_atencao = f"q_{metrica}_atencao"
-        nome_critico = f"q_{metrica}_critico"
-        nome_limiar_atencao = f"limiar_{metrica}_atencao"
-        nome_limiar_critico = f"limiar_{metrica}_critico"
-        limites = _limiar_valido(limiares_estado, metrica)
-        if limites is None:
-            df[nome_nivel] = "NAO_CONFIGURADO"
-            df[nome_atencao] = pd.Series(pd.NA, index=df.index, dtype="boolean")
-            df[nome_critico] = pd.Series(pd.NA, index=df.index, dtype="boolean")
-            df[nome_limiar_atencao] = np.nan
-            df[nome_limiar_critico] = np.nan
-            continue
-
-        lim_atencao, lim_critico = limites
+        lim_atencao = df[f"limiar_{metrica}_atencao"]
+        lim_critico = df[f"limiar_{metrica}_critico"]
+        configurado = lim_atencao.notna() & lim_critico.notna()
         valores = pd.to_numeric(df[metrica], errors="coerce")
-        nivel = pd.Series("NORMAL", index=df.index, dtype="object")
-        nivel.loc[valores.isna()] = "NAO_DETERMINADO"
-        nivel.loc[valores.gt(lim_atencao) & valores.le(lim_critico)] = "ATENCAO"
-        nivel.loc[valores.gt(lim_critico)] = "CRITICO"
-        df[nome_nivel] = nivel
-        flag_atencao = (valores.gt(lim_atencao) & valores.le(lim_critico)).astype("boolean")
-        flag_critico = valores.gt(lim_critico).astype("boolean")
-        flag_atencao.loc[valores.isna()] = pd.NA
-        flag_critico.loc[valores.isna()] = pd.NA
-        df[nome_atencao] = flag_atencao
-        df[nome_critico] = flag_critico
-        df[nome_limiar_atencao] = lim_atencao
-        df[nome_limiar_critico] = lim_critico
+        em_atencao = configurado & valores.gt(lim_atencao) & valores.le(lim_critico)
+        em_critico = configurado & valores.gt(lim_critico)
 
-    # Ordena somente depois que as chaves foram garantidas.
+        nivel = pd.Series("NORMAL", index=df.index, dtype="object")
+        nivel.loc[~configurado] = "NAO_CONFIGURADO"
+        nivel.loc[configurado & valores.isna()] = "NAO_DETERMINADO"
+        nivel.loc[em_atencao] = "ATENCAO"
+        nivel.loc[em_critico] = "CRITICO"
+        df[f"nivel_{metrica}"] = nivel
+
+        flag_atencao = em_atencao.astype("boolean")
+        flag_critico = em_critico.astype("boolean")
+        nao_avaliavel = ~configurado | valores.isna()
+        flag_atencao.loc[nao_avaliavel] = pd.NA
+        flag_critico.loc[nao_avaliavel] = pd.NA
+        df[f"q_{metrica}_atencao"] = flag_atencao
+        df[f"q_{metrica}_critico"] = flag_critico
+
+
+    # Ordena por identidade e timestamp para que diferenças e alertas sigam a ordem temporal.
     df = df.sort_values(CHAVES_BASE + ["ts"], kind="mergesort", na_position="last").reset_index(drop=True)
     duplicidade_chaves = CHAVES_BASE + ["ts"]
     if "sessao_origem" in df.columns:
         duplicidade_chaves.append("sessao_origem")
+    # Usa as chaves de identidade, timestamp e sessão para reconhecer amostras repetidas.
+    # keep="last" preserva a última versão da amostra duplicada.
     quantidade_duplicadas = int(df.duplicated(subset=duplicidade_chaves, keep="last").sum())
     if quantidade_duplicadas:
         df = df.drop_duplicates(subset=duplicidade_chaves, keep="last").reset_index(drop=True)
         print(f"Silver: descartadas {quantidade_duplicadas} amostras duplicadas; Bronze mantido intacto.")
 
-    # Reinícios de processo/sessão: não se inventam IDs de aeronave/FMC.
+    # Detecta reinício quando o contador de tempo/seq volta para trás ou a sessão muda.
+    # A mudança abre um novo grupo de sessão, sem alterar os IDs do FMC.
     reinicio = pd.Series(False, index=df.index, dtype=bool)
     grupos_base = df.groupby(CHAVES_BASE, dropna=False, sort=False)
     for coluna in ("uptime_proc_s", "seq"):
@@ -427,7 +451,8 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
         .cumsum().astype(int) + 1
     )
 
-    # Intervalo: metadado de fonte consistente; fallback apenas se timestamps repetem uma cadência.
+    # Descobre a cadência por grupo de sessão. Se o agente informou um intervalo
+    # consistente, usa esse valor; se não, só infere quando os timestamps repetem a cadência.
     df["intervalo_esperado_s"] = np.nan
     df["intervalo_origem"] = "INDETERMINADO"
     for _, grupo in df.groupby(CHAVES_AGRUPAMENTO, dropna=False, sort=False):
@@ -436,6 +461,8 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
         df.loc[grupo.index, "intervalo_origem"] = origem_intervalo
 
     grupos_sessao = df.groupby(CHAVES_AGRUPAMENTO, dropna=False, sort=False)
+    # diff compara cada timestamp com a amostra anterior do mesmo grupo.
+    # O resultado é o tempo real decorrido entre duas leituras consecutivas.
     df["dt_s"] = grupos_sessao["ts"].diff().dt.total_seconds()
     df["t_sessao_s"] = (df["ts"] - grupos_sessao["ts"].transform("min")).dt.total_seconds()
     intervalo_seguro = df["intervalo_esperado_s"].where(df["intervalo_esperado_s"] > 0)
@@ -456,6 +483,8 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
 
     # Taxas diferenciais de I/O, sem converter caracteres em bytes e sem transformar reset em zero.
     for tipo in ("leitura", "escrita"):
+        # diff obtém quanto o contador cresceu desde a amostra anterior.
+        # Se mudou a unidade, houve reset ou o intervalo é inválido, a taxa fica desconhecida.
         coluna = f"io_{tipo}_contador_acum"
         unidade = f"io_{tipo}_unidade"
         delta = grupos_sessao[coluna].diff()
@@ -469,7 +498,7 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
         df[f"io_{tipo}_chars_s"] = (delta_valido / df["dt_s"]).where(df[unidade].eq("chars"))
 
     # Coluna auxiliar interna não precisa ir à Silver persistida.
-    df = df.drop(columns=["_reinicio"])
+    df = df.drop(columns=["_reinicio", "_chave_host"])
     df.attrs["duplicatas_descartadas"] = quantidade_duplicadas
     return df
 
@@ -479,7 +508,8 @@ def processar_camada_silver(df_bronze: pd.DataFrame, limiares: dict | None = Non
 # ============================================================
 
 def regressao_linear(x: pd.Series, y: pd.Series, minimo_pontos: int = 3) -> float:
-    """Inclinação OLS de y por x; exige pontos e instantes distintos suficientes."""
+    # Calcula a tendência linear de y ao longo do tempo; exige pontos distintos.
+    # Remove valores inválidos antes do cálculo, para não contaminar a inclinação.
     dados = pd.DataFrame({"x": x, "y": y}).replace([np.inf, -np.inf], np.nan).dropna()
     if len(dados) < minimo_pontos or dados["x"].nunique() < 2:
         return np.nan
@@ -487,7 +517,7 @@ def regressao_linear(x: pd.Series, y: pd.Series, minimo_pontos: int = 3) -> floa
 
 
 def percentual_acima(serie: pd.Series, limite: float) -> float:
-    """Percentual acima do limite entre valores válidos; sem dados, retorna NaN."""
+    # Percentual acima do limite entre valores válidos; sem dados, retorna NaN.
     valores_validos = pd.to_numeric(serie, errors="coerce").dropna()
     if valores_validos.empty:
         return np.nan
@@ -495,6 +525,7 @@ def percentual_acima(serie: pd.Series, limite: float) -> float:
 
 
 def _limiar_valido(limiares: dict, metrica: str):
+    # Só aceita um par numérico completo em que atenção seja menor que crítico.
     limites = limiares.get(metrica)
     if not limites or len(limites) != 2:
         return None
@@ -507,10 +538,21 @@ def _limiar_valido(limiares: dict, metrica: str):
     return atencao, critico
 
 
-def _calcular_health_score(grupo: pd.DataFrame, limiares: dict, completude: float) -> tuple[float, str, float, float]:
-    """Score por severidade máxima por amostra; crítico não acumula também atenção."""
+def _limites_do_grupo(grupo: pd.DataFrame, metrica: str):
+    # Lê os limites do próprio computador, gravados na Silver; sem par único e válido, não há limite.
+    vazio = pd.Series(dtype=float)
+    atencao = pd.to_numeric(grupo.get(f"limiar_{metrica}_atencao", vazio), errors="coerce").dropna().unique()
+    critico = pd.to_numeric(grupo.get(f"limiar_{metrica}_critico", vazio), errors="coerce").dropna().unique()
+    if len(atencao) != 1 or len(critico) != 1:
+        return None
+    return _limiar_valido({metrica: (atencao[0], critico[0])}, metrica)
+
+
+def _calcular_health_score(grupo: pd.DataFrame, completude: float) -> tuple[float, str, float, float]:
+    # Score por severidade máxima por amostra; crítico não acumula também atenção.
+    # Primeiro identifica quais métricas têm limites válidos para esta execução.
     metricas_configuradas = [
-        metrica for metrica in METRICAS_ALERTAVEIS if _limiar_valido(limiares, metrica)
+        metrica for metrica in METRICAS_ALERTAVEIS if _limites_do_grupo(grupo, metrica)
     ]
     if not metricas_configuradas or pd.isna(completude):
         return np.nan, "DADOS_INSUFICIENTES", np.nan, np.nan
@@ -519,18 +561,21 @@ def _calcular_health_score(grupo: pd.DataFrame, limiares: dict, completude: floa
     critico_algum = pd.Series(False, index=grupo.index)
     amostra_valida = pd.Series(False, index=grupo.index)
     for metrica in metricas_configuradas:
+        # Cada amostra entra no denominador se pelo menos uma métrica configurada é válida.
         serie = pd.to_numeric(grupo[metrica], errors="coerce")
-        limite_atencao, limite_critico = _limiar_valido(limiares, metrica)
+        limite_atencao, limite_critico = _limites_do_grupo(grupo, metrica)
         valido = serie.notna() & np.isfinite(serie)
         amostra_valida |= valido
         critico_algum |= valido & (serie > limite_critico)
         atencao_alguma |= valido & (serie > limite_atencao) & (serie <= limite_critico)
 
+    # Usa só as amostras em que ao menos uma métrica configurada tem valor válido.
     denominador = int(amostra_valida.sum())
     if denominador < MIN_AMOSTRAS_HEALTH:
         return np.nan, "AMOSTRAS_INSUFICIENTES", np.nan, np.nan
     pct_critico = float((critico_algum & amostra_valida).sum() / denominador * 100)
     pct_atencao = float((atencao_alguma & ~critico_algum & amostra_valida).sum() / denominador * 100)
+    # Penaliza atenção e crítico com pesos diferentes e também considera a falta de dados.
     penalidade = (
         PESO_ATENCAO * pct_atencao
         + PESO_CRITICO * pct_critico
@@ -540,13 +585,14 @@ def _calcular_health_score(grupo: pd.DataFrame, limiares: dict, completude: floa
     return round(score, 1), "OK", round(pct_atencao, 2), round(pct_critico, 2)
 
 
-def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict, limiares: dict) -> dict:
-    """Calcula indicadores da sessão sem mascarar ausência de dados ou intervalos desconhecidos."""
+def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict) -> dict:
+    # Calcula indicadores da sessão sem mascarar ausência de dados ou intervalos desconhecidos.
     grupo = grupo.sort_values("ts").reset_index(drop=True)
     total_amostras = len(grupo)
     duracao_s = float(grupo["t_sessao_s"].max()) if total_amostras else 0.0
     intervalos = pd.to_numeric(grupo["intervalo_esperado_s"], errors="coerce").dropna()
     intervalo = float(intervalos.iloc[0]) if len(intervalos) and intervalos.nunique() == 1 else np.nan
+    # Sem uma cadência confiável não estimamos amostras esperadas nem completude.
     if np.isfinite(intervalo) and intervalo > 0:
         esperadas = max(1.0, duracao_s / intervalo + 1.0)
         completude = min(100.0, total_amostras / esperadas * 100.0)
@@ -558,18 +604,16 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict, limiares: d
     cpu = pd.to_numeric(grupo["cpu_pct"], errors="coerce")
     ram = pd.to_numeric(grupo["ram_pct"], errors="coerce")
     ram_bytes = pd.to_numeric(grupo["ram_logica_bytes"], errors="coerce")
-    temp = pd.to_numeric(grupo["temp_c"], errors="coerce")
     flash_pct = pd.to_numeric(grupo["flash_pct"], errors="coerce")
 
     cpu_media, cpu_std, cpu_p95, cpu_pico = cpu.mean(), cpu.std(), cpu.quantile(0.95), cpu.max()
     ram_media, ram_pico = ram.mean(), ram.max()
-    temp_media, temp_pico = temp.mean(), temp.max()
     ram_disponivel = pd.to_numeric(grupo["ram_disponivel_bytes"], errors="coerce")
     ram_disponivel_pct = pd.to_numeric(grupo["ram_disponivel_pct"], errors="coerce")
     ram_headroom_bytes = float(ram_disponivel.min()) if ram_disponivel.notna().any() else np.nan
     ram_headroom_pct = float(ram_disponivel_pct.min()) if ram_disponivel_pct.notna().any() else np.nan
+    # Guarda o tipo de medição para diferenciar RSS do processo de estimativa de host.
     tipos_ram = sorted(set(grupo["ram_medicao_tipo"].dropna().astype(str)))
-    tipos_temperatura = sorted(set(grupo["temperatura_tipo"].dropna().astype(str)))
 
     kpis = {
         **identificadores,
@@ -602,9 +646,6 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict, limiares: d
         "ram_headroom_bytes": round(ram_headroom_bytes, 0) if pd.notna(ram_headroom_bytes) else np.nan,
         "ram_headroom_pct": round(ram_headroom_pct, 2) if pd.notna(ram_headroom_pct) else np.nan,
         "ram_medicao_tipos": ";".join(tipos_ram),
-        "temp_media": round(temp_media, 2) if pd.notna(temp_media) else np.nan,
-        "temp_max": round(temp_pico, 2) if pd.notna(temp_pico) else np.nan,
-        "temperatura_tipos": ";".join(tipos_temperatura),
         "flash_media_pct": round(flash_pct.mean(), 2) if flash_pct.notna().any() else np.nan,
         "flash_max_pct": round(flash_pct.max(), 2) if flash_pct.notna().any() else np.nan,
     }
@@ -638,11 +679,12 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict, limiares: d
 
     kpis["flash_taxa_kbps"] = round(flash_taxa_bps / BYTES_POR_KB, 6) if pd.notna(flash_taxa_bps) else np.nan
     kpis["flash_capacidade_restante_h"] = round(flash_autonomia_h, 3) if pd.notna(flash_autonomia_h) else np.nan
-    # Mantido por compatibilidade; semântica documentada explicitamente como projeção de capacidade.
+    # Alias de nome antigo mantido para não quebrar dashboards que já leem esse KPI.
+    # O valor continua sendo projeção de capacidade do arquivo/log, não RUL física da Flash.
     kpis["flash_autonomia_h"] = kpis["flash_capacidade_restante_h"]
     kpis["flash_autonomia_tipo"] = "PROJECAO_CAPACIDADE_LOG" if pd.notna(flash_autonomia_h) else "INDETERMINADA"
 
-    health_score, health_status, pct_atencao, pct_critico = _calcular_health_score(grupo, limiares, completude)
+    health_score, health_status, pct_atencao, pct_critico = _calcular_health_score(grupo, completude)
     kpis["health_score"] = health_score
     kpis["health_score_status"] = health_status
     kpis["health_pct_amostras_atencao"] = pct_atencao
@@ -653,16 +695,6 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict, limiares: d
 # ============================================================
 # 5. ALERTAS COM PERSISTÊNCIA, HISTERESE E HISTÓRICO AUDITÁVEL
 # ============================================================
-
-def nivel_alerta(valor: float, limite_atencao: float, limite_critico: float):
-    if pd.isna(valor):
-        return None
-    if valor > limite_critico:
-        return "CRITICO"
-    if valor > limite_atencao:
-        return "ATENCAO"
-    return None
-
 
 def _registro_evento_alerta(identificadores, metrica, tipo_evento, nivel, valor,
                             limiar_violado, ts_abertura, linha_evento, fase_abertura,
@@ -685,8 +717,8 @@ def _registro_evento_alerta(identificadores, metrica, tipo_evento, nivel, valor,
     }
 
 
-def gerar_alertas(df_silver: pd.DataFrame, limiares: dict) -> pd.DataFrame:
-    """Gera eventos de abertura, escala, rebaixamento e encerramento de alertas."""
+def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
+    # Gera eventos de abertura, escala, rebaixamento e encerramento de alertas.
     registros = []
     colunas_saida = [
         *CHAVES_AGRUPAMENTO, "alerta_id", "metrica", "tipo_evento", "nivel", "valor",
@@ -700,24 +732,11 @@ def gerar_alertas(df_silver: pd.DataFrame, limiares: dict) -> pd.DataFrame:
         grupo = grupo_original.sort_values("ts").reset_index(drop=True)
 
         for metrica in METRICAS_ALERTAVEIS:
-            limites = _limiar_valido(limiares, metrica)
+            limites = _limites_do_grupo(grupo, metrica)
             if limites is None:
                 continue
             limite_atencao, limite_critico = limites
             col_nivel = f"nivel_{metrica}"
-            col_atencao = f"limiar_{metrica}_atencao"
-            col_critico = f"limiar_{metrica}_critico"
-            usa_state_detection_silver = all(
-                coluna in grupo.columns for coluna in (col_nivel, col_atencao, col_critico)
-            )
-            if usa_state_detection_silver:
-                at_configurados = pd.to_numeric(grupo[col_atencao], errors="coerce").dropna().unique()
-                cr_configurados = pd.to_numeric(grupo[col_critico], errors="coerce").dropna().unique()
-                usa_state_detection_silver = (
-                    len(at_configurados) == 1 and len(cr_configurados) == 1
-                    and np.isclose(float(at_configurados[0]), limite_atencao)
-                    and np.isclose(float(cr_configurados[0]), limite_critico)
-                )
             nivel_ativo = None
             ts_abertura = None
             fase_abertura = None
@@ -743,19 +762,15 @@ def gerar_alertas(df_silver: pd.DataFrame, limiares: dict) -> pd.DataFrame:
                     contador_pendente = 0
                     indice_inicio_pendente = None
 
-                if usa_state_detection_silver:
-                    nivel_fonte = linha.get(col_nivel)
-                    nivel_atual = (
-                        str(nivel_fonte) if nivel_fonte in ("ATENCAO", "CRITICO") else None
-                    )
-                else:
-                    nivel_atual = nivel_alerta(valor, limite_atencao, limite_critico)
+                nivel_fonte = linha.get(col_nivel)
+                nivel_atual = str(nivel_fonte) if nivel_fonte in ("ATENCAO", "CRITICO") else None
                 if pd.isna(valor):
                     nivel_pendente = None
                     contador_pendente = 0
                     indice_inicio_pendente = None
                     continue
 
+                # Sem alerta ativo, exige amostras consecutivas acima do limite para abrir.
                 if nivel_ativo is None:
                     if nivel_atual is None:
                         nivel_pendente = None
@@ -774,7 +789,7 @@ def gerar_alertas(df_silver: pd.DataFrame, limiares: dict) -> pd.DataFrame:
                         primeira = grupo.iloc[indice_inicio_pendente]
                         ts_abertura = primeira["ts"]
                         fase_abertura = str(primeira.get("fase", "NAO_DETERMINADA"))
-                        alerta_id = f"{identificadores.get('fmc_id')}:{metrica}:{ts_abertura.isoformat()}"
+                        alerta_id = f"{identificadores.get('hostname')}:{metrica}:{ts_abertura.isoformat()}"
                         limiar = limite_critico if nivel_ativo == "CRITICO" else limite_atencao
                         registros.append(_registro_evento_alerta(
                             identificadores, metrica, "ABERTURA", nivel_ativo, valor, limiar,
@@ -785,6 +800,7 @@ def gerar_alertas(df_silver: pd.DataFrame, limiares: dict) -> pd.DataFrame:
                         indice_inicio_pendente = None
 
                 elif nivel_ativo == "ATENCAO":
+                    # Um alerta de atenção só sobe para crítico após persistência crítica.
                     if nivel_atual == "CRITICO":
                         if not intervalo_consecutivo or nivel_pendente != "CRITICO":
                             nivel_pendente = "CRITICO"
@@ -816,6 +832,7 @@ def gerar_alertas(df_silver: pd.DataFrame, limiares: dict) -> pd.DataFrame:
                             nivel_ativo, ts_abertura, fase_abertura, alerta_id = None, None, None, None
 
                 else:  # alerta CRITICO
+                    # A histerese evita alternar de nível quando o valor fica perto do limite.
                     nivel_pendente = None
                     contador_pendente = 0
                     indice_inicio_pendente = None
@@ -846,7 +863,7 @@ def gerar_alertas(df_silver: pd.DataFrame, limiares: dict) -> pd.DataFrame:
 # ============================================================
 
 def calcular_kpis_por_fase(df_silver: pd.DataFrame) -> pd.DataFrame:
-    """Resume métricas por fase explícita/inferida; fases não modeladas não recebem baseline inventado."""
+    # Resume métricas por fase; fases não modeladas não recebem baseline inventado.
     chaves = CHAVES_AGRUPAMENTO + ["fase"]
     resultado = (
         df_silver.groupby(chaves, dropna=False, observed=True)
@@ -857,13 +874,12 @@ def calcular_kpis_por_fase(df_silver: pd.DataFrame) -> pd.DataFrame:
             cpu_pico=("cpu_pct", "max"),
             ram_media=("ram_pct", "mean"),
             flash_media=("flash_pct", "mean"),
-            temp_max=("temp_c", "max"),
             lacunas=("q_lacuna", lambda valores: valores.sum(min_count=1)),
             amostras_ausentes_estimadas=("q_amostras_ausentes", lambda valores: valores.sum(min_count=1)),
         )
         .reset_index()
     )
-    for coluna in ("cpu_media", "cpu_pico", "ram_media", "flash_media", "temp_max"):
+    for coluna in ("cpu_media", "cpu_pico", "ram_media", "flash_media"):
         resultado[coluna] = resultado[coluna].round(2)
 
     mapa_cpu_esperada = {nome: cpu for nome, _, cpu, _ in FASES_VOO}
@@ -875,15 +891,16 @@ def calcular_kpis_por_fase(df_silver: pd.DataFrame) -> pd.DataFrame:
     return resultado
 
 
-def processar_camada_gold(df_silver: pd.DataFrame, limiares: dict):
-    """Mantém a assinatura original de retorno dos quatro conjuntos Gold principais."""
+def processar_camada_gold(df_silver: pd.DataFrame, componentes=None):
+    # Cria KPIs por sessão, série por minuto, KPIs por fase e eventos de alerta.
     kpis_sessao = []
     for chave, grupo in df_silver.groupby(CHAVES_AGRUPAMENTO, dropna=False, sort=False):
         chave = chave if isinstance(chave, tuple) else (chave,)
         identificadores = dict(zip(CHAVES_AGRUPAMENTO, chave))
-        kpis_sessao.append(calcular_kpis_sessao(grupo, identificadores, limiares))
+        kpis_sessao.append(calcular_kpis_sessao(grupo, identificadores))
     df_kpis_sessao = pd.DataFrame(kpis_sessao)
 
+    # Agrega cada minuto e mantém a fase para não misturar, por exemplo, subida e cruzeiro.
     df_serie_1min = (
         df_silver.groupby(
             CHAVES_AGRUPAMENTO + ["fase", pd.Grouper(key="ts", freq="1min")],
@@ -894,17 +911,15 @@ def processar_camada_gold(df_silver: pd.DataFrame, limiares: dict):
             cpu_media=("cpu_pct", "mean"),
             ram_media=("ram_pct", "mean"),
             flash_media=("flash_pct", "mean"),
-            temp_media=("temp_c", "mean"),
-            temp_max=("temp_c", "max"),
             lacunas=("q_lacuna", lambda valores: valores.sum(min_count=1)),
         )
         .reset_index()
     )
-    for coluna in ("cpu_media", "ram_media", "flash_media", "temp_media", "temp_max"):
+    for coluna in ("cpu_media", "ram_media", "flash_media"):
         df_serie_1min[coluna] = df_serie_1min[coluna].round(3)
 
     df_kpis_fase = calcular_kpis_por_fase(df_silver)
-    df_alertas = gerar_alertas(df_silver, limiares)
+    df_alertas = vincular_componente_alertas(gerar_alertas(df_silver), componentes)
     return df_kpis_sessao, df_serie_1min, df_kpis_fase, df_alertas
 
 
@@ -913,7 +928,8 @@ def _chave_normalizada(linha: pd.Series, colunas: list[str]) -> tuple:
 
 
 def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_alertas: pd.DataFrame) -> pd.DataFrame:
-    """Consolida a última amostra/KPI por FMC e o estado atual de cada alerta auditável."""
+    # Consolida último estado, health score e quantidade/severidade dos alertas por FMC.
+    # Repassa os eventos na ordem do tempo para saber quais alertas continuam abertos.
     colunas_saida = [
         *CHAVES_FMC, "ultima_amostra_utc", "ultima_fase", "ultima_sessao", "amostras_sessao",
         "completude_pct", "health_score", "health_score_status", "alertas_abertos",
@@ -985,8 +1001,9 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_a
 # 7. UPLOAD OPCIONAL PARA S3
 # ============================================================
 
-def enviar_arquivos_s3(caminhos_locais: list, prefixo: str, df_silver: pd.DataFrame) -> None:
-    """Envia resultados quando há credenciais; falha de S3 não impede uso local."""
+def enviar_arquivos_s3(caminhos_locais: list, prefixo: str) -> None:
+    # Envia resultados quando há credenciais; falha de S3 não impede uso local.
+    # Importa boto3 só se o envio for solicitado e as credenciais estiverem configuradas.
     bucket = os.getenv("S3_BUCKET_NAME")
     chave_acesso = os.getenv("AWS_ACCESS_KEY_ID")
     chave_secreta = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -1003,14 +1020,10 @@ def enviar_arquivos_s3(caminhos_locais: list, prefixo: str, df_silver: pd.DataFr
         print(f"Não foi possível criar cliente S3: {erro}")
         return
 
-    empresas = df_silver["empresa_id"].dropna().astype(str).unique()
-    aeronaves = df_silver["aeronave_id"].dropna().astype(str).unique()
-    empresa_path = empresas[0] if len(empresas) == 1 else "MULTI_EMPRESA"
-    aeronave_path = aeronaves[0] if len(aeronaves) == 1 else "FROTA"
     for caminho in caminhos_locais:
         if not os.path.exists(caminho):
             continue
-        chave_s3 = f"{prefixo}/empresa={empresa_path}/aeronave={aeronave_path}/{os.path.basename(caminho)}"
+        chave_s3 = f"{prefixo}/{os.path.basename(caminho)}"
         try:
             s3.upload_file(caminho, bucket, chave_s3)
             print(f"S3 OK: s3://{bucket}/{chave_s3}")
@@ -1023,54 +1036,83 @@ def enviar_arquivos_s3(caminhos_locais: list, prefixo: str, df_silver: pd.DataFr
 # ============================================================
 
 if __name__ == "__main__":
-    if not os.path.exists(ARQUIVO_BRONZE):
-        raise SystemExit(f"Arquivo Bronze '{ARQUIVO_BRONZE}' não encontrado. Execute o agente primeiro.")
+    # Normalmente não precisa informar --bronze: o agente deixou a fonte escolhida no JSON.
+    # O argumento continua disponível para testes ou para processar um CSV específico.
+    terminal = argparse.ArgumentParser(description="Pipeline ETL AirPulse: Bronze -> Silver -> Gold")
+    terminal.add_argument(
+        "--bronze", default=None,
+        help="Sobrescreve a fonte automática (ex.: bronze_bruto.csv ou bronze_semana.csv).",
+    )
+    comandos = terminal.parse_args()
+    arquivo_bronze = comandos.bronze or selecionar_arquivo_bronze()
 
-    print(f"Lendo Bronze: {ARQUIVO_BRONZE}")
-    df_bronze = pd.read_csv(ARQUIVO_BRONZE, sep=";")
+    if not os.path.exists(arquivo_bronze):
+        raise SystemExit(f"Arquivo Bronze '{arquivo_bronze}' não encontrado. Execute o agente primeiro.")
+
+    print(f"Lendo Bronze: {arquivo_bronze}")
+    df_bronze = pd.read_csv(arquivo_bronze, sep=";")
     if df_bronze.empty:
         raise SystemExit("O arquivo Bronze existe, mas não contém amostras.")
 
-    limiares = carregar_limiares_do_banco()
+    cadastro, componentes = carregar_cadastro_do_banco()
+
     print("Processando Silver...")
     try:
-        df_silver = processar_camada_silver(df_bronze, limiares)
+        df_silver = processar_camada_silver(df_bronze, cadastro, componentes)
     except (ValueError, TypeError) as erro:
         raise SystemExit(f"Erro de esquema/qualidade no Bronze: {erro}") from erro
 
+    # Hostname que não está no cadastro vai para quarentena: fica marcado e guardado, nunca é
+    # descartado em silêncio nem entra na Gold (não dá para saber de qual empresa é).
     PASTA_SILVER.mkdir(parents=True, exist_ok=True)
+    nao_cadastrado = df_silver["q_hostname_nao_cadastrado"].fillna(False).astype(bool)
+    if nao_cadastrado.any():
+        caminho_quarentena = PASTA_SILVER / "silver_quarentena_hostname.csv"
+        df_silver[nao_cadastrado].to_csv(caminho_quarentena, sep=";", index=False, encoding="utf-8")
+        hosts = ", ".join(sorted(df_silver.loc[nao_cadastrado, "hostname"].astype(str).unique()))
+        print(f"ATENÇÃO: {int(nao_cadastrado.sum())} amostra(s) de hostname não cadastrado "
+              f"({hosts}) enviadas para {caminho_quarentena}.")
+        df_silver = df_silver[~nao_cadastrado].reset_index(drop=True)
+    if df_silver.empty:
+        raise SystemExit("Nenhuma amostra de hostname cadastrado para processar.")
+
+    # A Silver fica em um CSV porque cada linha ainda representa uma amostra tratada.
     caminho_silver = PASTA_SILVER / "silver_telemetria.csv"
     df_silver.to_csv(caminho_silver, sep=";", index=False, encoding="utf-8")
     print(f"Silver salvo: {caminho_silver} ({len(df_silver)} linhas)")
 
+    # A Gold é calculada a partir da Silver já tipada e validada.
+    # Cada arquivo Gold tem um nível de detalhe diferente, por isso eles ficam separados.
     print("Processando Gold...")
-    df_sessao, df_serie, df_fase, df_alertas = processar_camada_gold(df_silver, limiares)
+    df_sessao, df_serie, df_fase, df_alertas = processar_camada_gold(df_silver, componentes)
     df_resumo_fmc = criar_resumo_fmc(df_silver, df_sessao, df_alertas)
     PASTA_GOLD.mkdir(parents=True, exist_ok=True)
     arquivos_gold = {
-        PASTA_GOLD / "gold_kpi_sessao.csv": df_sessao,
-        PASTA_GOLD / "gold_serie_1min.csv": df_serie,
-        PASTA_GOLD / "gold_kpi_fase.csv": df_fase,
-        PASTA_GOLD / "gold_alertas.csv": df_alertas,
-        PASTA_GOLD / "gold_resumo_fmc.csv": df_resumo_fmc,
+        PASTA_GOLD / "gold_kpi_sessao.csv": anexar_cadastro(df_sessao, df_silver),
+        PASTA_GOLD / "gold_serie_1min.csv": anexar_cadastro(df_serie, df_silver),
+        PASTA_GOLD / "gold_kpi_fase.csv": anexar_cadastro(df_fase, df_silver),
+        PASTA_GOLD / "gold_alertas.csv": anexar_cadastro(df_alertas, df_silver),
+        PASTA_GOLD / "gold_resumo_fmc.csv": anexar_cadastro(df_resumo_fmc, df_silver),
     }
     for caminho, dados in arquivos_gold.items():
         dados.to_csv(caminho, sep=";", index=False, encoding="utf-8")
         print(f"Gold salvo: {caminho} ({len(dados)} linhas)")
 
+    df_sessao = anexar_cadastro(df_sessao, df_silver)
     colunas_resumo = [
-        "fmc_id", "placa_id", "sessao", "duracao_min", "amostras", "completude_pct",
-        "cpu_media", "cpu_p95", "ram_media", "ram_tendencia_kb_h", "flash_autonomia_h",
-        "health_score", "health_score_status",
+        "hostname", "empresa_nome", "aeronave_nome", "sessao", "duracao_min", "amostras",
+        "completude_pct", "cpu_media", "cpu_p95", "ram_media", "ram_tendencia_kb_h",
+        "flash_autonomia_h", "health_score", "health_score_status",
     ]
     colunas_presentes = [coluna for coluna in colunas_resumo if coluna in df_sessao.columns]
     print("\nResumo Gold por sessão:")
     print(df_sessao[colunas_presentes].to_string(index=False))
     if not df_alertas.empty:
         print(f"\nEventos de alerta registrados: {len(df_alertas)}")
-        print(df_alertas[["fmc_id", "metrica", "tipo_evento", "nivel", "valor", "fase"]].to_string(index=False))
+        print(df_alertas[["hostname", "metrica", "tipo_evento", "nivel", "valor", "fase"]].to_string(index=False))
     else:
         print("\nNenhum evento de alerta gerado nesta execução.")
 
-    enviar_arquivos_s3([str(caminho_silver)], "silver", df_silver)
-    enviar_arquivos_s3([str(caminho) for caminho in arquivos_gold], "gold", df_silver)
+    # Upload é opcional: sem bucket/credenciais, os arquivos continuam disponíveis localmente.
+    enviar_arquivos_s3([str(caminho_silver)], "silver")
+    enviar_arquivos_s3([str(caminho) for caminho in arquivos_gold], "gold")

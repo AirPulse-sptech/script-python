@@ -17,7 +17,7 @@ MARGEM_SEGURANCA = 0.10                    # Nunca deixa o PC com menos de 10% d
 RAM_MAX_PCT = 85                           # Teto de segurança (85% da RAM total do PC)
 
 def ajustar_memoria_ram(porcentagem_desejada):
-    """Calcula quantos tijolos de 50MB precisamos criar ou destruir para bater a meta de RAM."""
+    # Calcula quantos tijolos de 50MB precisamos criar ou destruir para bater a meta de RAM.
     global blocos_de_memoria_ram
     
     memoria_do_pc = psutil.virtual_memory()
@@ -53,7 +53,7 @@ def ajustar_memoria_ram(porcentagem_desejada):
 # 2. GERENCIADOR DE CPU E DISCO
 # =====================================================================
 def estressar_cpu_processador(meta_de_uso_compartilhada, sinal_de_parada):
-    """Trabalha e dorme em frações de segundo para bater a meta exata de CPU."""
+    # Trabalha e dorme em frações de segundo para bater a meta exata de CPU.
     while not sinal_de_parada.is_set():
         tempo_trabalhando = meta_de_uso_compartilhada.value * 0.1
         tempo_inicio = time.perf_counter()
@@ -67,7 +67,7 @@ def estressar_cpu_processador(meta_de_uso_compartilhada, sinal_de_parada):
         time.sleep(max(0, tempo_para_dormir))
 
 def gravar_arquivos_no_disco(fator_escrita, kb_extra=0):
-    """Escreve dados falsos na 'Flash' para gerar desgaste e I/O reais."""
+    # Escreve dados falsos na 'Flash' para gerar desgaste e I/O reais.
     with open("fmc_flash_bite.log", "ab") as arquivo:
         # Sorteia entre 10KB e 50KB e multiplica pela aceleração e pelos extras do cenário
         quantidade_kb = random.randint(10, 50) * fator_escrita + kb_extra
@@ -106,7 +106,7 @@ CENARIOS = {
 }
 
 def calcular_alvos_neste_segundo(fase_atual, porcentagem_concluida_da_fase, anomalias_ativas):
-    """Verifica se neste exato momento existe alguma anomalia substituindo os valores normais."""
+    # Verifica se neste exato momento existe alguma anomalia substituindo os valores normais.
     cpu = fase_atual["uso_cpu"]
     ram = fase_atual["uso_ram"]
     kb_extra_flash = 0
@@ -139,7 +139,7 @@ def calcular_alvos_neste_segundo(fase_atual, porcentagem_concluida_da_fase, anom
 
 
 def gravar_metadados_atomicos(caminho, metadados):
-    """Atualiza os metadados sem expor JSON parcialmente escrito ao agente."""
+    # Atualiza os metadados sem expor JSON parcialmente escrito ao agente.
     temporario = f"{caminho}.tmp"
     with open(temporario, "w", encoding="utf-8") as arquivo:
         json.dump(metadados, arquivo, ensure_ascii=False)

@@ -1,2 +1,0 @@
-empresa_id;aeronave_id;fmc_id;fmc_tipo;placa_id;origem;hostname;sessao;fase;registros;cpu_amostras_validas;cpu_media;cpu_pico;ram_media;flash_media;temp_max;lacunas;amostras_ausentes_estimadas;cpu_esperado;ram_esperada;cpu_desvio_esperado;ram_desvio_esperado
-EMP-01;PR-XYZ;FMC-01;principal;1;SIMULADA_BANCADA;Fonte;1;PREFLIGHT;6;6;29.63;29.78;13.15;3.86;49.9;0;0.0;30;13;-0.37;0.15
