@@ -1,0 +1,13 @@
+{
+  "arquivo_bronze": "C:\\Users\\loure\\Personal\\Repositorios\\script-python\\bronze_semana_20261013T171143Z.csv",
+  "bucket": null,
+  "chave_s3": null,
+  "s3_uri": null,
+  "chave_manifesto_s3": null,
+  "hostname": "GERADOR_SINTETICO",
+  "sessao_id": "SEMANA-2026-10-06-20261013T171143Z",
+  "modo": "semana",
+  "estado_coleta": "EM_ANDAMENTO",
+  "atualizado_em_utc": "2026-10-13T17:11:48.831881+00:00",
+  "data_inicio": "2026-10-06"
+}

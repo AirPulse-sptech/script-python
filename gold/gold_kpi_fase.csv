@@ -1,0 +1,4 @@
+hostname;computador_id;tipo_fmc;status_computador;aeronave_id;aeronave_nome;aeronave_modelo;companhia_aerea;empresa_id;empresa_nome;sessao;fase;registros;cpu_amostras_validas;cpu_media;cpu_pico;ram_media;flash_media;lacunas;amostras_ausentes_estimadas;cpu_esperado;ram_esperada;cpu_desvio_esperado;ram_desvio_esperado
+GERADOR_SINTETICO;;;;;;;;;;1;EM_VOO;618;618;38.02;45.3;53.95;52.7;0;0.0;;;;
+GERADOR_SINTETICO;;;;;;;;;;1;SOLO;1146;1146;12.03;18.6;48.03;52.7;0;0.0;;;;
+GERADOR_SINTETICO;;;;;;;;;;1;TRANSICAO;252;252;72.14;78.2;53.92;52.71;0;0.0;;;;

@@ -1,0 +1,2 @@
+hostname;computador_id;tipo_fmc;status_computador;aeronave_id;aeronave_nome;aeronave_modelo;companhia_aerea;empresa_id;empresa_nome;ultima_amostra_utc;ultima_fase;ultima_sessao;amostras_sessao;completude_pct;health_score;health_score_status;alertas_abertos;alertas_criticos_abertos;alertas_atencao_abertos;estado_saude
+GERADOR_SINTETICO;;;;;;;;;;2026-10-13T02:55:00+00:00;SOLO;1;2016;100.0;95.0;OK;0;0;0;SEM_ALERTAS_ATIVOS
