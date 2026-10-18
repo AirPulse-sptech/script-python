@@ -43,7 +43,7 @@ def _chave_manifesto_por_hostname(hostname):
 
 
 def obter_cliente_s3():
-    """Usa credenciais explícitas quando fornecidas; caso contrário, a cadeia padrão boto3/IAM Role."""
+    #Usa credenciais quando fornecidas, senão, usa o padrão do boto3/IAM Role
     import boto3
 
     configuracao = {"region_name": AWS_REGION}
@@ -64,7 +64,7 @@ def obter_cliente_s3():
 
 
 def selecionar_arquivo_bronze():
-    """Localiza o Bronze local para modo local/auto, sem depender de um CSV na EC2."""
+    #Localiza o Bronze local para modo local ou auto, sem depender de um CSV na EC2.
     if ARQUIVO_BRONZE:
         if os.path.exists(ARQUIVO_BRONZE):
             return ARQUIVO_BRONZE
@@ -1005,7 +1005,9 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_a
 # 7. UPLOAD OPCIONAL PARA S3
 
 def enviar_arquivos_s3(caminhos_locais: list, prefixo: str, hostname: str, sessao_id: str) -> None:
-    """Envia Silver/Gold com chaves por host e sessão; usa IAM Role quando disponível."""
+    #Envia Silver/Gold com chaves por host e sessão.
+    # usa IAM Role se tiver disponível
+
     habilitado = os.getenv("ENVIAR_S3", "true").strip().lower() in ("1", "true", "yes", "sim")
     bucket = BUCKET_NAME
     if not habilitado:
@@ -1024,19 +1026,27 @@ def enviar_arquivos_s3(caminhos_locais: list, prefixo: str, hostname: str, sessa
         f"{prefixo.strip('/')}/hostname={_segmento_s3(hostname)}"
         f"/sessao={_segmento_s3(sessao_id)}"
     )
+
     for caminho in caminhos_locais:
         if not os.path.exists(caminho):
             print(f"Arquivo local não encontrado para upload: {caminho}")
             continue
+
+        #Avisa q o dict é json se o nome termina em .json
+        extra = None
+        if str(caminho).endswith(".json"):
+            extra = {"ContentType": "application/json"}
+
         chave_s3 = f"{prefixo_chave}/{os.path.basename(caminho)}"
         try:
-            s3.upload_file(caminho, bucket, chave_s3)
+            s3.upload_file(caminho, bucket, chave_s3, ExtraArgs=extra) #ExtraArgs é pra passar metadados (tipo falar q o dict é json)
+            
             print(f"S3 OK: s3://{bucket}/{chave_s3}")
         except Exception as erro:
             print(f"Erro ao enviar {caminho} para o S3: {erro}")
 
 
-# 8. EXECUÇÃO DO PIPELINE
+# EXECUÇÃO DO PIPELINE
 if __name__ == "__main__":
     terminal = argparse.ArgumentParser(
         description="Pipeline ETL AirPulse: Bronze no local ou S3 -> Silver -> Gold"
@@ -1174,15 +1184,17 @@ if __name__ == "__main__":
     df_sessao, df_serie, df_fase, df_alertas = processar_camada_gold(df_silver, componentes)
     df_resumo_fmc = criar_resumo_fmc(df_silver, df_sessao, df_alertas)
     PASTA_GOLD.mkdir(parents=True, exist_ok=True)
+    #Arquivos enviados ao bucket gold devem ser JSON
     arquivos_gold = {
-        PASTA_GOLD / "gold_kpi_sessao.csv": anexar_cadastro(df_sessao, df_silver),
-        PASTA_GOLD / "gold_serie_1min.csv": anexar_cadastro(df_serie, df_silver),
-        PASTA_GOLD / "gold_kpi_fase.csv": anexar_cadastro(df_fase, df_silver),
-        PASTA_GOLD / "gold_alertas.csv": anexar_cadastro(df_alertas, df_silver),
-        PASTA_GOLD / "gold_resumo_fmc.csv": anexar_cadastro(df_resumo_fmc, df_silver),
+        PASTA_GOLD / "gold_kpi_sessao.json": anexar_cadastro(df_sessao, df_silver),
+        PASTA_GOLD / "gold_serie_1min.json": anexar_cadastro(df_serie, df_silver),
+        PASTA_GOLD / "gold_kpi_fase.json": anexar_cadastro(df_fase, df_silver),
+        PASTA_GOLD / "gold_alertas.json": anexar_cadastro(df_alertas, df_silver),
+        PASTA_GOLD / "gold_resumo_fmc.json": anexar_cadastro(df_resumo_fmc, df_silver),
     }
     for caminho, dados in arquivos_gold.items():
-        dados.to_csv(caminho, sep=";", index=False, encoding="utf-8")
+        dados.to_json(caminho, orient="records", date_format="iso",
+                    force_ascii=False, indent=2)
         print(f"Gold salvo: {caminho} ({len(dados)} linhas)")
 
     df_sessao = anexar_cadastro(df_sessao, df_silver)

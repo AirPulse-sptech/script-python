@@ -8,11 +8,13 @@ import multiprocessing as mp
 from datetime import datetime, timezone, timedelta
 import psutil
 
-# =====================================================================
-# 1. GERENCIADOR DE MEMÓRIA RAM
-# =====================================================================
+
+# GERENCIADOR DE MEMÓRIA RAM
+
 blocos_de_memoria_ram = []
-TAMANHO_DO_BLOCO_BYTES = 50 * 1024 * 1024  # Tijolos de 50 Megabytes
+#TAMANHO_DO_BLOCO_BYTES = 50 * 1024 * 1024  # Tijolos de 50 Megabytes
+#Se usar RAM simulada de 4mb
+TAMANHO_DO_BLOCO_BYTES = 1 * 1024 * 1024
 MARGEM_SEGURANCA = 0.10                    # Nunca deixa o PC com menos de 10% de RAM
 RAM_MAX_PCT = 85                           # Teto de segurança (85% da RAM total do PC)
 
@@ -37,7 +39,7 @@ def ajustar_memoria_ram(porcentagem_desejada):
         blocos_que_cabem_na_folga = int(max(0, memoria_de_folga) // TAMANHO_DO_BLOCO_BYTES)
         
         if blocos_que_cabem_na_folga < blocos_faltantes:
-            print(f"⚠️ PC sem memória real suficiente. Limitando a {blocos_que_cabem_na_folga} blocos extras.")
+            print(f"PC sem memória real suficiente. Limitando a {blocos_que_cabem_na_folga} blocos extras.")
             blocos_necessarios = len(blocos_de_memoria_ram) + blocos_que_cabem_na_folga
 
     # Se faltam blocos, adiciona novos
@@ -49,9 +51,9 @@ def ajustar_memoria_ram(porcentagem_desejada):
     while len(blocos_de_memoria_ram) > blocos_necessarios:
         blocos_de_memoria_ram.pop()
 
-# =====================================================================
-# 2. GERENCIADOR DE CPU E DISCO
-# =====================================================================
+
+# GERENCIADOR DE CPU E DISCO
+
 def estressar_cpu_processador(meta_de_uso_compartilhada, sinal_de_parada):
     # Trabalha e dorme em frações de segundo para bater a meta exata de CPU.
     while not sinal_de_parada.is_set():
@@ -76,9 +78,9 @@ def gravar_arquivos_no_disco(fator_escrita, kb_extra=0):
         bytes_aleatorios = os.urandom(quantidade_de_bytes)
         arquivo.write(bytes_aleatorios)
 
-# =====================================================================
-# 3. ROTEIRO DO VOO E CENÁRIOS
-# =====================================================================
+
+# ROTEIRO DO VOO E CENÁRIOS
+
 FASES_DO_VOO = [
     {"nome": "BOOT",      "minutos": 1,  "uso_cpu": 65, "uso_ram": 0},
     {"nome": "PREFLIGHT", "minutos": 15, "uso_cpu": 30, "uso_ram": 13},
@@ -146,9 +148,9 @@ def gravar_metadados_atomicos(caminho, metadados):
     os.replace(temporario, caminho)
 
 
-# =====================================================================
-# 4. EXECUÇÃO PRINCIPAL
-# =====================================================================
+
+# EXECUÇÃO PRINCIPAL
+
 if __name__ == "__main__":
     # Permite escolher o cenário via linha de comando
     terminal = argparse.ArgumentParser(description="Simulador de Hardware FMC")
@@ -214,7 +216,7 @@ if __name__ == "__main__":
             }
             gravar_metadados_atomicos(caminho_meta, metadados_fase)
 
-            print(f"✈️ Fase: {fase['nome']:<10} | Duração: {segundos_reais_espera:.1f}s | CPU Base: {fase['uso_cpu']}% | RAM Base: {fase['uso_ram']}%")
+            print(f"Fase: {fase['nome']:<10} | Duração: {segundos_reais_espera:.1f}s | CPU Base: {fase['uso_cpu']}% | RAM Base: {fase['uso_ram']}%")
 
             # Salva no gabarito os horários exatos que as anomalias vão acontecer
             for a in anomalias_escolhidas:

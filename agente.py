@@ -12,7 +12,9 @@ from datetime import date, datetime, timedelta, timezone, time as hora
 import pandas as pd
 import psutil
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
+
 # Identidade e nuvem. Em EC2, prefira uma IAM Role em vez de chaves fixas no .env.
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("aws_access_key_id")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("aws_secret_access_key")
@@ -49,6 +51,48 @@ COLUNAS = [
     "io_leitura_contador_acum", "io_escrita_contador_acum",
     "io_leitura_unidade", "io_escrita_unidade",
 ]
+
+# Identidades virtuais disponíveis para a simulação.
+PLACAS_SIMULADAS = [
+    "FMC-SIM-PLACA-01",
+    "FMC-SIM-PLACA-02",
+]
+
+ARQUIVO_ROTACAO = "placa_rotacao.json"
+
+
+def selecionar_hostname_logico():
+    # Por padrão, começa pela primeira identidade.
+    indice = 0
+
+    # Recupera qual identidade deve ser usada nesta execução.
+    if os.path.exists(ARQUIVO_ROTACAO):
+        try:
+            with open(ARQUIVO_ROTACAO, encoding="utf-8") as arquivo:
+                estado = json.load(arquivo)
+            indice = int(estado.get("proximo_indice", 0))
+        except (OSError, ValueError, TypeError):
+            indice = 0
+
+    # Garante que o índice fique dentro da lista.
+    indice %= len(PLACAS_SIMULADAS)
+    hostname_logico = PLACAS_SIMULADAS[indice]
+
+    # Deixa a próxima identidade preparada para a próxima execução.
+    estado = {
+        "proximo_indice": (indice + 1) % len(PLACAS_SIMULADAS)
+    }
+
+    # Grava o estado de forma atômica para evitar JSON incompleto.
+    temporario = f"{ARQUIVO_ROTACAO}.tmp"
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        json.dump(estado, arquivo, indent=2)
+
+    os.replace(temporario, ARQUIVO_ROTACAO)
+
+    return hostname_logico
+
+
 def obter_cliente_s3():
     """Cria cliente S3 com chaves explícitas ou com a cadeia padrão boto3/IAM Role."""
     import boto3
@@ -190,9 +234,11 @@ def salvar_localmente(amostra, caminho_destino=CAMINHO_CSV):
                 f"[{amostra['timestamp_utc']}] Amostra #{amostra['seq']} | "
                 f"CPU host estimada: {float(cpu_exibida):.1f}%"
             )
+
 def calibrar_baseline_ram():
     # Não subtrai o RSS de outro processo; retorna zero para usar RSS observado.
     return 0
+
 def _normalizar_nome_processo(valor):
     # Normaliza nome de script independentemente do SO e de separadores.
     #
@@ -205,9 +251,9 @@ def _normalizar_nome_processo(valor):
     if nome.endswith(".py"):
         nome = nome[:-3]
     return "".join(caractere for caractere in nome if caractere.isalnum())
+
 def encontrar_processo_simulador():
     # Localiza a bancada por nome normalizado; permite configurar o nome alvo.
-    #
     # Por compatibilidade, reconhece o nome padrão configurado e o nome real
     # usado neste repositório (bancadaVoo.py), mesmo com underscore/hífen.
     #
@@ -235,6 +281,7 @@ def encontrar_processo_simulador():
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
     return None
+
 def ler_metadados_bancada(proc):
     # Lê metadados explícitos do simulador; tolera arquivos de versões antigas.
     try:
@@ -408,7 +455,7 @@ def rodar_modo_real(simulador_inicial=None):
             sessao_id=SESSAO_EXECUCAO, modo="real", estado_coleta="CONCLUIDA",
         )
         if not enviado_final:
-            print("ATENÇÃO: o Bronze foi mantido localmente, mas o envio final ao S3 falhou.")
+            print("Bronze foi mantido localmente, mas o envio final ao S3 falhou.")
     print(f"Coleta encerrada. Bronze real salvo em {CAMINHO_CSV} ({seq} novas amostras).")
 def estado_simulado_voo(instante_atual, agenda_de_voos):
     for partida, chegada in agenda_de_voos:
@@ -452,7 +499,7 @@ def criar_agenda_simples(data_inicio):
 def rodar_modo_semana(data_inicio, enviar_s3):
     # O modo é escolhido uma vez na inicialização: sem bancada ativa, gera a semana sintética.
     # Depois de escolhido, não fica verificando nem cancela a geração no meio do caminho.
-    print("📅 Modo SEMANA: gerando 7 dias em intervalos de 300 segundos...")
+    print("Modo SEMANA: gerando 7 dias em intervalos de 300 segundos...")
     fuso = timezone(timedelta(hours=-3))
     rng = random.Random(42)
     agenda_de_voos = criar_agenda_simples(data_inicio)
@@ -518,7 +565,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
         caminho_semana, "semana", data_inicio, hostname="GERADOR_SINTETICO",
         sessao_id=sessao_semana, estado_coleta="EM_ANDAMENTO",
     )
-    print(f"✅ Arquivo {caminho_semana} gerado com {len(linhas_do_csv)} amostras.")
+    print(f"Arquivo {caminho_semana} gerado com {len(linhas_do_csv)} amostras.")
     if enviar_s3:
         s3_client = obter_cliente_s3()
         nome_arquivo = os.path.basename(caminho_semana)
