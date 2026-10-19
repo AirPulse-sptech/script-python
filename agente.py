@@ -43,7 +43,7 @@ ARQUIVO_META = "bancada_meta.json"
 # Campos derivados ficam para as camadas seguintes; os aliases repetidos de I/O foram retirados.
 COLUNAS = [
     "timestamp_utc", "seq",
-    "hostname", "origem", "uptime_proc_s", "fator_tempo", "cpu_percent", "cpu_nucleos",
+    "hostname", "placa_numero_serie", "origem", "uptime_proc_s", "fator_tempo", "cpu_percent", "cpu_nucleos",
     "qtd_tarefas", "ram_usada_bytes", "ram_baseline_bytes", "ram_total_bytes",
     "ram_disponivel_bytes", "flash_usada_bytes", "flash_total_bytes",
     "modo_execucao", "intervalo_coleta_s", "sessao_origem", "fase",
@@ -52,49 +52,57 @@ COLUNAS = [
     "io_leitura_unidade", "io_escrita_unidade",
 ]
 
-# Identidades virtuais disponíveis para a simulação.
-PLACAS_SIMULADAS = [
-    "FMC-SIM-PLACA-01",
-    "FMC-SIM-PLACA-02",
-]
 
-ARQUIVO_ROTACAO = "placa_rotacao.json"
-
-
-def selecionar_hostname_logico():
-    # Por padrão, começa pela primeira identidade.
-    indice = 0
-
-    # Recupera qual identidade deve ser usada nesta execução.
-    if os.path.exists(ARQUIVO_ROTACAO):
+def carregar_placas(metadados):
+    placas = []
+    for item in metadados.get("placas") or []:
         try:
-            with open(ARQUIVO_ROTACAO, encoding="utf-8") as arquivo:
-                estado = json.load(arquivo)
-            indice = int(estado.get("proximo_indice", 0))
-        except (OSError, ValueError, TypeError):
-            indice = 0
+            serie, pid = str(item["numero_serie"]).strip(), int(item["pid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        comps = {str(c).upper() for c in item.get("componentes") or []} & {"CPU", "RAM", "DISCO"}
+        if serie and comps:
+            placas.append({"serie": serie, "pid": pid, "componentes": comps,
+                           "arquivo_flash": item.get("arquivo_flash")})
+    return placas
 
-    # Garante que o índice fique dentro da lista.
-    indice %= len(PLACAS_SIMULADAS)
-    hostname_logico = PLACAS_SIMULADAS[indice]
-
-    # Deixa a próxima identidade preparada para a próxima execução.
-    estado = {
-        "proximo_indice": (indice + 1) % len(PLACAS_SIMULADAS)
-    }
-
-    # Grava o estado de forma atômica para evitar JSON incompleto.
-    temporario = f"{ARQUIVO_ROTACAO}.tmp"
-    with open(temporario, "w", encoding="utf-8") as arquivo:
-        json.dump(estado, arquivo, indent=2)
-
-    os.replace(temporario, ARQUIVO_ROTACAO)
-
-    return hostname_logico
+def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram):
+    comp = placa["componentes"]
+    a = dict.fromkeys(COLUNAS)  # vazio por padrão: só preenche o que a placa mede
+    cpu_bruto, tarefas = medir_cpu_e_tarefas(proc, cache)
+    a.update({
+        "timestamp_utc": ts, "hostname": HOSTNAME, "placa_numero_serie": placa["serie"],
+        "origem": "SIMULADA_BANCADA", "uptime_proc_s": max(0, int(time.time() - proc.create_time())),
+        "fator_tempo": fator_tempo, "qtd_tarefas": tarefas, "modo_execucao": "voo",
+        "intervalo_coleta_s": INTERVALO_COLETA_S, "sessao_origem": metadados.get("sessao_origem"),
+        "fase": metadados.get("fase") or "NAO_DETERMINADA",
+    })
+    if "CPU" in comp:
+        nucleos = psutil.cpu_count(logical=True) or 1
+        a.update({"cpu_percent": cpu_bruto, "cpu_nucleos": nucleos, "cpu_pct_host": cpu_bruto / nucleos,
+                  "cpu_semantica": "soma_percentual_por_nucleo"})
+    if "RAM" in comp:
+        a.update({"ram_usada_bytes": proc.memory_info().rss, "ram_baseline_bytes": baseline_ram,
+                  "ram_total_bytes": RAM_TOTAL_REFERENCIA_BYTES,
+                  "ram_disponivel_bytes": psutil.virtual_memory().available,
+                  "ram_baseline_fonte": "SEM_SUBTRACAO", "ram_medicao_tipo": "RSS_PROCESSO"})
+    if "DISCO" in comp:
+        try:
+            flash = os.path.getsize(os.path.join(cwd, placa["arquivo_flash"]))
+        except FileNotFoundError:
+            flash = 0
+        except (OSError, TypeError):
+            flash = None
+        rc, ru = _ler_contador_io(proc, "read")
+        wc, wu = _ler_contador_io(proc, "write")
+        a.update({"flash_usada_bytes": flash, "flash_total_bytes": FMC_FLASH_TOTAL_BYTES,
+                  "io_leitura_contador_acum": rc, "io_escrita_contador_acum": wc,
+                  "io_leitura_unidade": ru, "io_escrita_unidade": wu})
+    return a
 
 
 def obter_cliente_s3():
-    """Cria cliente S3 com chaves explícitas ou com a cadeia padrão boto3/IAM Role."""
+    #Cria cliente S3 com chaves explícitas ou com a cadeia padrão boto3/IAM Role
     import boto3
 
     if not BUCKET_NAME:
@@ -115,7 +123,7 @@ def obter_cliente_s3():
 
 
 def _segmento_s3(valor):
-    """Evita barras e caracteres problemáticos em segmentos de chaves S3."""
+    #Evita barras e caracteres problemáticos em segmentos de chaves S3
     segmento = re.sub(r"[^A-Za-z0-9._-]+", "_", str(valor or "desconhecido").strip())
     return segmento.strip("._-") or "desconhecido"
 
@@ -135,7 +143,7 @@ def registrar_bronze_ativo(
     sessao_id=SESSAO_EXECUCAO,
     estado_coleta="EM_ANDAMENTO",
 ):
-    """Registra localmente e, quando houver referência S3, publica o manifesto no bucket."""
+    #Registra localmente e, quando houver referência S3, publica o manifesto no bucket
     estado = {
         "arquivo_bronze": os.path.abspath(caminho_csv),
         "bucket": BUCKET_NAME if chave_s3 else None,
@@ -178,7 +186,7 @@ def enviar_lote_nuvem(
     data_inicio=None,
     estado_coleta="EM_ANDAMENTO",
 ):
-    """Envia o CSV completo da sessão e publica o manifesto somente após o upload."""
+    #Envia o CSV completo da sessão e publica o manifesto somente após o upload
     if s3_client is None:
         print("Erro: cliente S3 não foi inicializado.")
         return False
@@ -292,6 +300,7 @@ def ler_metadados_bancada(proc):
         return dados
     except (OSError, ValueError, TypeError, psutil.Error):
         return {}
+    
 def ler_fator_tempo(proc):
     # Mantém a interface usada em versões antigas do agente.
     metadados = ler_metadados_bancada(proc)
@@ -300,6 +309,7 @@ def ler_fator_tempo(proc):
         return fator if fator > 0 else 1.0
     except (TypeError, ValueError):
         return 1.0
+    
 def medir_cpu_e_tarefas(proc, cache_filhos):
     # Soma CPU percentual por processo (escala psutil, por núcleo) e threads.
     cpu_total = proc.cpu_percent(interval=None)
@@ -321,6 +331,7 @@ def medir_cpu_e_tarefas(proc, cache_filhos):
         if pid not in vivos:
             del cache_filhos[pid]
     return cpu_total, tarefas_total
+
 def _ler_contador_io(proc, tipo):
     # Prioriza contadores de bytes; fallback para caracteres fica identificado.
     try:
@@ -336,6 +347,7 @@ def _ler_contador_io(proc, tipo):
     if valor_chars is not None:
         return int(valor_chars), "chars"
     return None, "desconhecida"
+
 def detectar_modo_automatico(janela_s=None):
     # Escolhe uma vez: bancada ativa = coleta real; senão = semana sintética.
     janela = JANELA_DETECCAO_BANCADA_S if janela_s is None else max(0.0, janela_s)
@@ -349,6 +361,7 @@ def detectar_modo_automatico(janela_s=None):
             return "semana", None
         # Dá alguns segundos para a bancada iniciar, sem pedir um modo no terminal.
         time.sleep(min(0.5, restante))
+
 def rodar_modo_real(simulador_inicial=None):
     print(
     f"Agente AirPulse iniciado no host {HOSTNAME}. "
@@ -364,99 +377,61 @@ def rodar_modo_real(simulador_inicial=None):
     s3_client = obter_cliente_s3()
     baseline_ram = calibrar_baseline_ram()
     seq = 0
-    cache_filhos = {}
-    try:
-        metadados = ler_metadados_bancada(simulador)
-        fator_tempo = ler_fator_tempo(simulador)
-        print(
-            f"Bancada detectada (PID {simulador.pid}) | "
-            f"Fator de tempo: {fator_tempo:g}x"
-        )
-        # A primeira chamada inicializa os contadores de CPU; evita um pico falso.
-        medir_cpu_e_tarefas(simulador, cache_filhos)
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        print("A bancada encerrou antes da primeira amostra. Nenhum dado novo foi coletado.")
-        return
+    procs_placa = {}   # serie é (Process, cache_filhos)
+    seq_placa = {}
+    ciclos = 0
+    print(f"Bancada detectada (PID {simulador.pid})")
     proximo_ciclo = time.monotonic() + INTERVALO_COLETA_S
     while True:
         try:
             if not simulador.is_running():
                 break
             time.sleep(max(0, proximo_ciclo - time.monotonic()))
-            # Se a bancada encerrou durante a espera, não cria uma amostra artificial.
             if not simulador.is_running():
                 break
             agora_monotonico = time.monotonic()
             proximo_ciclo += INTERVALO_COLETA_S
             if proximo_ciclo <= agora_monotonico:
                 proximo_ciclo = agora_monotonico + INTERVALO_COLETA_S
-            cpu_percent_bruto, qtd_tarefas = medir_cpu_e_tarefas(simulador, cache_filhos)
-            nucleos = psutil.cpu_count(logical=True) or 1
-            cpu_pct_host = cpu_percent_bruto / nucleos
             metadados = ler_metadados_bancada(simulador)
             try:
-                fator_tempo = float(metadados.get("acelerador", ler_fator_tempo(simulador)))
+                fator_tempo = float(metadados.get("acelerador", 1))
             except (TypeError, ValueError):
-                fator_tempo = ler_fator_tempo(simulador)
-            # Lê o contador cumulativo e guarda explicitamente sua unidade.
-            # Se o sistema não oferecer o contador, o valor continua desconhecido.
-            read_cont, read_unit = _ler_contador_io(simulador, "read")
-            write_cont, write_unit = _ler_contador_io(simulador, "write")
-            try:
-                flash_usada = os.path.getsize(os.path.join(simulador.cwd(), ARQUIVO_FLASH))
-            except FileNotFoundError:
-                flash_usada = 0
-            except (OSError, psutil.Error):
-                flash_usada = None
-            amostra = {
-                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                "seq": seq + 1,
-                "hostname": HOSTNAME,
-                "origem": "SIMULADA_BANCADA",
-                "uptime_proc_s": max(0, int(time.time() - simulador.create_time())),
-                "fator_tempo": fator_tempo,
-                "cpu_percent": cpu_percent_bruto,
-                "cpu_nucleos": nucleos,
-                "qtd_tarefas": qtd_tarefas,
-                "ram_usada_bytes": simulador.memory_info().rss,
-                "ram_baseline_bytes": baseline_ram,
-                "ram_total_bytes": RAM_TOTAL_REFERENCIA_BYTES,
-                "ram_disponivel_bytes": psutil.virtual_memory().available,
-                "flash_usada_bytes": flash_usada,
-                "flash_total_bytes": FMC_FLASH_TOTAL_BYTES,
-                "modo_execucao": "voo",
-                "intervalo_coleta_s": INTERVALO_COLETA_S,
-                "sessao_origem": metadados.get("sessao_origem"),
-                "fase": metadados.get("fase") or "NAO_DETERMINADA",
-                "cpu_pct_host": cpu_pct_host,
-                "cpu_semantica": "soma_percentual_por_nucleo",
-                "ram_baseline_fonte": "SEM_SUBTRACAO",
-                "ram_medicao_tipo": "RSS_PROCESSO",
-                "io_leitura_contador_acum": read_cont,
-                "io_escrita_contador_acum": write_cont,
-                "io_leitura_unidade": read_unit,
-                "io_escrita_unidade": write_unit,
-            }
-            seq += 1
-            salvar_localmente(amostra)
-            if seq % AMOSTRAS_POR_LOTE == 0:
-                enviar_lote_nuvem(
-                    s3_client, CAMINHO_CSV, hostname=HOSTNAME,
-                    sessao_id=SESSAO_EXECUCAO, modo="real", estado_coleta="EM_ANDAMENTO",
-                )
+                fator_tempo = 1.0
+            ts = datetime.now(timezone.utc).isoformat()
+            cwd = simulador.cwd()
+            gravou = False
+            for placa in carregar_placas(metadados):
+                serie = placa["serie"]
+                try:
+                    if serie not in procs_placa:
+                        proc, cache = psutil.Process(placa["pid"]), {}
+                        medir_cpu_e_tarefas(proc, cache)  # aquece contador; sem linha neste ciclo
+                        procs_placa[serie] = (proc, cache)
+                        continue
+                    proc, cache = procs_placa[serie]
+                    amostra = amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram)
+                except psutil.Error:
+                    procs_placa.pop(serie, None)  # filho sumiu; não sintetiza linha
+                    continue
+                seq_placa[serie] = seq_placa.get(serie, 0) + 1
+                amostra["seq"] = seq_placa[serie]
+                salvar_localmente(amostra)
+                gravou = True
+            if gravou:
+                ciclos += 1
+                if ciclos % AMOSTRAS_POR_LOTE == 0:
+                    enviar_lote_nuvem(s3_client, CAMINHO_CSV, hostname=HOSTNAME,
+                                      sessao_id=SESSAO_EXECUCAO, modo="real", estado_coleta="EM_ANDAMENTO")
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            # A amostra perdida não é sintetizada; a Silver calculará a lacuna temporal.
             break
-    # Envia o snapshot final sempre, inclusive quando o último lote coincidiu com a cadência.
-    # O manifesto passa a CONCLUIDA somente depois do upload final do CSV completo.
-    if seq:
-        enviado_final = enviar_lote_nuvem(
-            s3_client, CAMINHO_CSV, hostname=HOSTNAME,
-            sessao_id=SESSAO_EXECUCAO, modo="real", estado_coleta="CONCLUIDA",
-        )
+    if ciclos:   # era `if seq:`
+        enviado_final = enviar_lote_nuvem(s3_client, CAMINHO_CSV, hostname=HOSTNAME,
+                                          sessao_id=SESSAO_EXECUCAO, modo="real", estado_coleta="CONCLUIDA")
         if not enviado_final:
             print("Bronze foi mantido localmente, mas o envio final ao S3 falhou.")
-    print(f"Coleta encerrada. Bronze real salvo em {CAMINHO_CSV} ({seq} novas amostras).")
+    print(f"Coleta encerrada. Bronze real salvo em {CAMINHO_CSV} ({sum(seq_placa.values())} novas amostras).")
+
 def estado_simulado_voo(instante_atual, agenda_de_voos):
     for partida, chegada in agenda_de_voos:
         if partida <= instante_atual < chegada:
@@ -466,6 +441,7 @@ def estado_simulado_voo(instante_atual, agenda_de_voos):
                 return 72, True
             return 38, True
     return 12, False
+
 def fase_semana(instante_atual, agenda_de_voos):
     # O modo semanal não simula as dez fases detalhadas do roteiro da bancada.
     for partida, chegada in agenda_de_voos:
@@ -476,6 +452,7 @@ def fase_semana(instante_atual, agenda_de_voos):
                 return "TRANSICAO"
             return "EM_VOO"
     return "SOLO"
+
 def criar_agenda_simples(data_inicio):
     fuso = timezone(timedelta(hours=-3))
     voos_por_dia = [6, 6, 6, 6, 7, 5, 6]
@@ -496,6 +473,7 @@ def criar_agenda_simples(data_inicio):
             agenda.append((hora_da_partida, hora_da_chegada))
             hora_da_partida = hora_da_chegada + timedelta(minutes=rng.choice([40, 45, 50]))
     return agenda
+
 def rodar_modo_semana(data_inicio, enviar_s3):
     # O modo é escolhido uma vez na inicialização: sem bancada ativa, gera a semana sintética.
     # Depois de escolhido, não fica verificando nem cancela a geração no meio do caminho.
@@ -554,6 +532,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
             "io_leitura_unidade": "bytes",
             "io_escrita_unidade": "bytes",
         }
+
         linhas_do_csv.append(pacote)
     # Toda a semana cabe em um Bronze único; cada linha representa uma amostra de 5 minutos.
     sessao_semana = f"SEMANA-{data_inicio.isoformat()}-{INICIO_EXECUCAO}"
@@ -586,6 +565,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
             "Envio ao S3 desabilitado. "
             "Execute com --enviar-s3 para habilitar."
         )
+
 def executar_automaticamente(data_inicio=None, enviar_s3=False):
     # Usa coleta real se encontrar a bancada; sem ela, gera o Bronze semanal.
     modo, simulador = detectar_modo_automatico()
@@ -599,6 +579,7 @@ def executar_automaticamente(data_inicio=None, enviar_s3=False):
     print("Bancada não encontrada. O modo automático será SEMANA SINTÉTICA.")
     rodar_modo_semana(data_inicio, enviar_s3)
     return "semana"
+
 if __name__ == "__main__":
     import argparse
     # o próprio agente decide qual fonte usar.

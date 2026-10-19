@@ -5,6 +5,7 @@
 # unidades explícitas. Este pipeline não reconstrói métricas a partir de colunas
 # antigas: quando uma medição canônica estiver ausente, ela permanece desconhecida.
 import argparse
+import datetime
 import io
 import json
 import os
@@ -217,15 +218,16 @@ COLUNAS_CADASTRO = [
 ]
 MAPA_TIPO_METRICA = {"CPU": "cpu_pct", "RAM": "ram_pct", "DISCO": "flash_pct", "FLASH": "flash_pct"}
 SQL_CADASTRO = (
-    "SELECT c.nome, c.idComputador, c.tipoFmc, c.statusComputador, "
+    "SELECT c.hostname, c.idComputador, c.tipoFmc, c.statusComputador, "
     "a.idAeronave, a.nome, a.modelo, a.companhiaAerea, "
     "e.idEmpresaFabricante, COALESCE(NULLIF(e.nomeFantasia, ''), e.razaoSocial) "
     "FROM computador c "
     "JOIN aeronave a ON a.idAeronave = c.fkAeronave "
     "JOIN empresaFabricante e ON e.idEmpresaFabricante = a.fkEmpresaFabricante"
 )
+
 SQL_COMPONENTES = (
-    "SELECT c.nome, co.idComponente, co.tipo, p.idPlaca, p.nome, p.numeroSerie, "
+    "SELECT c.hostname, co.idComponente, co.tipo, p.idPlaca, p.nome, p.numeroSerie, "
     "co.limiteAtencao, co.limiteCritico "
     "FROM componente co "
     "JOIN placa p ON p.idPlaca = co.fkPlaca "
@@ -241,6 +243,35 @@ def _chave_placa(serie: pd.Series) -> pd.Series:
     # Série vazia ou nula vira NaN: nunca casa com nenhuma placa cadastrada.
     texto = serie.astype(str).str.strip().str.lower()
     return texto.where(serie.notna() & texto.ne(""), np.nan)
+
+def carregar_placas_do_banco(hostname):
+    # Placas e componentes ATIVOS do computador cujo nome = hostname. Sem banco/placa: aborta.
+    import pymysql
+    try:
+        con = pymysql.connect(
+            host=os.getenv("DB_HOST", "localhost"), database=os.getenv("DB_DATABASE", "airpulse"),
+            user=os.getenv("DB_USER", ""), password=os.getenv("DB_PASSWORD", ""),
+            port=int(os.getenv("DB_PORT", "3306")), connect_timeout=5)
+        try:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT p.numeroSerie, co.tipo FROM placa p "
+                    "JOIN computador c ON c.idComputador = p.fkComputador "
+                    "JOIN componente co ON co.fkPlaca = p.idPlaca "
+                    "WHERE LOWER(c.nome) = LOWER(%s) AND co.statusMonitoramento = 'ATIVO'", (hostname,))
+                linhas = cur.fetchall()
+        finally:
+            con.close()
+    except Exception as erro:
+        raise SystemExit(f"Não foi possível ler as placas no MySQL: {erro}")
+    por_serie = {}
+    for serie, tipo in linhas:
+        tipo = "DISCO" if str(tipo).upper() == "FLASH" else str(tipo).upper()
+        if serie and tipo in ("CPU", "RAM", "DISCO"):
+            por_serie.setdefault(str(serie).strip(), set()).add(tipo)
+    if not por_serie:
+        raise SystemExit(f"Hostname '{hostname}' sem placa ativa no cadastro.")
+    return [{"serie": s, "componentes": c} for s, c in por_serie.items()]
 
 def carregar_cadastro_do_banco():
     # Devolve (df_cadastro, df_componentes). Se o banco não responder, devolve (None, None):
@@ -912,7 +943,7 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                         f"{identificadores.get('hostname')}:{identificadores.get('placa_numero_serie')}"
                         f":{metrica}:{ts_abertura.isoformat()}"
                         )
-                        
+
                         limiar = limite_critico if nivel_ativo == "CRITICO" else limite_atencao
                         registros.append(_registro_evento_alerta(
                             identificadores, metrica, "ABERTURA", nivel_ativo, valor, limiar,
