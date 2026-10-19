@@ -14,9 +14,9 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 load_dotenv()
-# ============================================================
-# 1. CONFIGURAÇÕES E CONTRATOS
-# ============================================================
+
+# CONFIGURAÇÕES E CONTRATOS
+
 # Configuração comum de S3 entre agente e ETL. Em EC2, use IAM Role.
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -69,12 +69,15 @@ def selecionar_arquivo_bronze():
         if os.path.exists(ARQUIVO_BRONZE):
             return ARQUIVO_BRONZE
         raise FileNotFoundError(f"ARQUIVO_BRONZE='{ARQUIVO_BRONZE}' não existe neste computador.")
+    
     if os.path.exists(ARQUIVO_ESTADO_BRONZE):
         try:
             with open(ARQUIVO_ESTADO_BRONZE, encoding="utf-8") as arquivo:
                 estado = json.load(arquivo)
+
         except (OSError, json.JSONDecodeError) as erro:
             raise RuntimeError(f"Não foi possível ler {ARQUIVO_ESTADO_BRONZE}: {erro}") from erro
+        
         caminho = estado.get("arquivo_bronze") if isinstance(estado, dict) else None
         if caminho and os.path.exists(caminho):
             return caminho
@@ -82,6 +85,7 @@ def selecionar_arquivo_bronze():
     for caminho in ("bronze_bruto.csv", "bronze_semana.csv"):
         if os.path.exists(caminho):
             return caminho
+        
     raise FileNotFoundError(
         "Nenhum Bronze local foi encontrado. Use --origem s3 --hostname HOST ou --s3-key CHAVE."
     )
@@ -91,12 +95,16 @@ def _interpretar_referencia_s3(referencia, bucket_padrao):
     if not referencia:
         return bucket_padrao, None
     referencia = str(referencia).strip()
+
     if referencia.startswith("s3://"):
         resto = referencia[5:]
         partes = resto.split("/", 1)
+
         if len(partes) != 2 or not partes[0] or not partes[1]:
             raise ValueError(f"URI S3 inválida: {referencia}")
+        
         return partes[0], partes[1]
+    
     return bucket_padrao, referencia.lstrip("/")
 
 
@@ -145,6 +153,7 @@ def carregar_bronze_s3(*, bucket=None, s3_key=None, hostname=None, manifest_key=
         if not isinstance(metadata, dict):
             raise ValueError(f"O manifesto S3 {chave_manifesto} não contém um objeto JSON.")
         bucket_manifesto = metadata.get("bucket")
+
         if bucket_manifesto:
             bucket = bucket_manifesto
         referencia = (
@@ -152,6 +161,7 @@ def carregar_bronze_s3(*, bucket=None, s3_key=None, hostname=None, manifest_key=
         )
         bucket_ref, chave_objeto = _interpretar_referencia_s3(referencia, bucket)
         bucket = bucket_ref or bucket
+
         if not chave_objeto:
             raise ValueError(
                 f"O manifesto s3://{bucket}/{chave_manifesto} não informa chave_s3/s3_uri. "
@@ -198,9 +208,10 @@ CHAVES_AGRUPAMENTO = CHAVES_BASE + ["sessao"]
 CHAVES_FMC = ["hostname"]
 BYTES_POR_KB = 1024
 METRICAS_ALERTAVEIS = ("cpu_pct", "ram_pct", "flash_pct")
-# ============================================================
-# 2. CADASTRO DO MYSQL: hostname -> computador -> aeronave -> empresa (+ placas e limites)
-# ============================================================
+CHAVES_BASE = ["hostname", "placa_numero_serie"]
+CHAVES_FMC = ["hostname"]   # resumo continua por FMC
+
+# CADASTRO DO MYSQL: hostname -> computador -> aeronave -> empresa -> placas e limites
 # Premissa do projeto: computador.nome é o hostname da máquina e é único.
 COLUNAS_CADASTRO = [
     "computador_id", "tipo_fmc", "status_computador",
@@ -217,16 +228,18 @@ SQL_CADASTRO = (
     "JOIN empresaFabricante e ON e.idEmpresaFabricante = a.fkEmpresaFabricante"
 )
 SQL_COMPONENTES = (
-    "SELECT c.nome, co.id_componente, co.tipo, p.idPlaca, p.nome, "
+    "SELECT c.nome, co.idComponente, co.tipo, p.idPlaca, p.nome, p.numeroSerie, "
     "co.limiteAtencao, co.limiteCritico "
     "FROM componente co "
     "JOIN placa p ON p.idPlaca = co.fkPlaca "
     "JOIN computador c ON c.idComputador = p.fkComputador "
     "WHERE co.statusMonitoramento = 'ATIVO'"
 )
-def _chave_hostname(serie: pd.Series) -> pd.Series:
+
+def _chave_hostname(serie: pd.Series) -> pd.Series: 
     # Compara hostnames sem diferenciar maiúsculas/minúsculas (Windows costuma devolver em MAIÚSCULAS).
     return serie.astype(str).str.strip().str.lower()
+
 def carregar_cadastro_do_banco():
     # Devolve (df_cadastro, df_componentes). Se o banco não responder, devolve (None, None):
     # o pipeline continua por hostname, só que sem empresa/aeronave e com os limites padrão.
@@ -241,30 +254,42 @@ def carregar_cadastro_do_banco():
             port=int(os.getenv("DB_PORT", "3306")),
             connect_timeout=5,
         )
+
         with conexao.cursor() as cursor:
             cursor.execute(SQL_CADASTRO)
             linhas_cadastro = cursor.fetchall()
             cursor.execute(SQL_COMPONENTES)
             linhas_componentes = cursor.fetchall()
+
     except Exception as erro:
         print(f"MySQL indisponível ({erro}); seguindo só por hostname, com limites padrão.")
         return None, None
+    
     finally:
         if conexao is not None:
             conexao.close()
+
     cadastro = pd.DataFrame(linhas_cadastro, columns=["hostname", *COLUNAS_CADASTRO])
+
     for coluna in ("computador_id", "aeronave_id", "empresa_id"):
         cadastro[coluna] = cadastro[coluna].astype("Int64")
+
     componentes = pd.DataFrame(linhas_componentes, columns=[
         "hostname", "componente_id", "tipo", "placa_id", "placa_nome", "limiteAtencao", "limiteCritico",
     ])
+
     componentes["metrica"] = componentes["tipo"].astype(str).str.upper().map(MAPA_TIPO_METRICA)
+
     componentes = componentes.dropna(subset=["metrica"]).reset_index(drop=True)
+
     for coluna in ("limiteAtencao", "limiteCritico"):
         componentes[coluna] = pd.to_numeric(componentes[coluna], errors="coerce")
+
     print(f"Cadastro carregado: {len(cadastro)} computador(es), {len(componentes)} componente(s) ativo(s).")
+
     return cadastro, componentes
-def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame:
+
+def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame: # -> é para falar oq será retornado pelo def
     # Liga cada amostra ao cadastro pelo hostname e traz os limites de cada computador.
     df["_chave_host"] = _chave_hostname(df["hostname"])
     if cadastro is None:
@@ -272,6 +297,8 @@ def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame:
             df[coluna] = np.nan
         # Sem banco não dá para saber se o hostname existe: fica desconhecido, não "falso".
         df["q_hostname_nao_cadastrado"] = pd.Series(pd.NA, index=df.index, dtype="boolean")
+        
+        
     else:
         ref = cadastro.assign(_chave_host=_chave_hostname(cadastro["hostname"])).drop(columns="hostname")
         duplicados = ref["_chave_host"].duplicated(keep="first")
@@ -279,78 +306,107 @@ def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame:
             print("Aviso: hostnames repetidos no cadastro (a premissa é nome único): "
                   + ", ".join(sorted(ref.loc[duplicados, "_chave_host"].unique())))
             ref = ref[~duplicados]
+
         df = df.merge(ref, on="_chave_host", how="left")
         df["q_hostname_nao_cadastrado"] = df["computador_id"].isna()
     # Limites por computador (cadastrados pelo gestor); CPU cai no padrão documentado se faltar.
+    
+
     for metrica in METRICAS_ALERTAVEIS:
         df[f"limiar_{metrica}_atencao"] = np.nan
         df[f"limiar_{metrica}_critico"] = np.nan
+
     if componentes is not None and not componentes.empty:
         lim = componentes.assign(_chave_host=_chave_hostname(componentes["hostname"]))
+
         for metrica in METRICAS_ALERTAVEIS:
             do_host = lim[lim["metrica"] == metrica].groupby("_chave_host")[["limiteAtencao", "limiteCritico"]].mean()
             df[f"limiar_{metrica}_atencao"] = pd.to_numeric(df["_chave_host"].map(do_host["limiteAtencao"]), errors="coerce")
             df[f"limiar_{metrica}_critico"] = pd.to_numeric(df["_chave_host"].map(do_host["limiteCritico"]), errors="coerce")
+
     for metrica, (padrao_atencao, padrao_critico) in LIMITES_PADRAO.items():
         sem_limite = df[f"limiar_{metrica}_atencao"].isna() | df[f"limiar_{metrica}_critico"].isna()
         df.loc[sem_limite, f"limiar_{metrica}_atencao"] = padrao_atencao
         df.loc[sem_limite, f"limiar_{metrica}_critico"] = padrao_critico
+
     for metrica in METRICAS_ALERTAVEIS:
         colunas = [f"limiar_{metrica}_atencao", f"limiar_{metrica}_critico"]
         invalido = ~(df[colunas[0]] < df[colunas[1]])  # também pega NaN
         df.loc[invalido, colunas] = np.nan
+
     return df
-def anexar_cadastro(df_gold: pd.DataFrame, df_silver: pd.DataFrame) -> pd.DataFrame:
+
+
+def anexar_cadastro(df_gold: pd.DataFrame, df_silver: pd.DataFrame) -> pd.DataFrame: # -> é para falar oq será retornado pelo def
     # Coloca empresa/aeronave/computador (vindos do Silver) nas tabelas Gold, pelo hostname.
     if df_gold.empty:
         return df_gold
+    
     ref = df_silver[["hostname", *COLUNAS_CADASTRO]].drop_duplicates("hostname")
+
     saida = df_gold.merge(ref, on="hostname", how="left")
+
     primeiras = ["hostname", *COLUNAS_CADASTRO]
+
     return saida[primeiras + [c for c in saida.columns if c not in primeiras]]
-def vincular_componente_alertas(df_alertas: pd.DataFrame, componentes) -> pd.DataFrame:
+
+def vincular_componente_alertas(df_alertas: pd.DataFrame, componentes) -> pd.DataFrame:  # -> é para falar oq será retornado pelo def
     # Liga cada alerta ao componente e à placa monitorados (cpu->CPU, ram->RAM, flash->DISCO).
     novas = ["componente_id", "placa_id", "placa_nome"]
     if componentes is None or componentes.empty or df_alertas.empty:
         for coluna in novas:
             df_alertas[coluna] = np.nan
         return df_alertas
+    
     comp = componentes[["hostname", "metrica", *novas]].copy()
+
     comp["_chave_host"] = _chave_hostname(comp["hostname"])
+
     comp = comp.drop(columns="hostname").drop_duplicates(["_chave_host", "metrica"])
+
     saida = df_alertas.assign(_chave_host=_chave_hostname(df_alertas["hostname"]))
+
     return saida.merge(comp, on=["_chave_host", "metrica"], how="left").drop(columns="_chave_host")
-def _garantir_coluna(df: pd.DataFrame, nome: str, valor_padrao=np.nan) -> None:
+
+def _garantir_coluna(df: pd.DataFrame, nome: str, valor_padrao=np.nan) -> None: # -> é para falar oq será retornado pelo def
     if nome not in df.columns:
         df[nome] = valor_padrao
-def _inferir_intervalo(grupo: pd.DataFrame) -> tuple[float, str]:
+
+def _inferir_intervalo(grupo: pd.DataFrame) -> tuple[float, str]: # -> é para falar oq será retornado pelo def
     # Usa metadado consistente; sem metadado exige cadência repetida nos timestamps.
     if "intervalo_coleta_s" in grupo.columns:
         valores = pd.to_numeric(grupo["intervalo_coleta_s"], errors="coerce")
         valores = valores[np.isfinite(valores) & (valores > 0)].round(6).unique()
         if len(valores) == 1:
             return float(valores[0]), "METADADO_FONTE"
+        
         if len(valores) > 1:
             return np.nan, "METADADO_INCONSISTENTE"
+        
     deltas = grupo["ts"].sort_values().diff().dt.total_seconds()
+
     deltas = deltas[np.isfinite(deltas) & (deltas > 0)].round(3)
     if len(deltas) < 2:
         return np.nan, "INDETERMINADO"
+    
     frequencias = deltas.value_counts()
     maior_frequencia = int(frequencias.max())
     if maior_frequencia < 2:
         return np.nan, "INDETERMINADO"
+    
     moda = sorted(float(valor) for valor, contagem in frequencias.items() if contagem == maior_frequencia)
     return moda[0], "INFERIDO_TIMESTAMPS"
-# ============================================================
-# 3. BRONZE -> SILVER: VALIDAÇÃO, TIPAGEM, QUALIDADE E DERIVAÇÕES
-# ============================================================
-def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=None) -> pd.DataFrame:
+
+# BRONZE -> SILVER: VALIDAÇÃO, TIPAGEM, QUALIDADE E DERIVAÇÕES
+
+def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=None) -> pd.DataFrame: # -> é para falar oq será retornado pelo def
     # Transforma Bronze sem preencher métricas/identidades desconhecidas com valores falsos.
     if not isinstance(df_bronze, pd.DataFrame):
         raise TypeError("Bronze deve ser um pandas.DataFrame.")
+    
     if df_bronze.empty:
         raise ValueError("O Bronze não contém amostras.")
+    
     df = df_bronze.copy()
     # São os campos mínimos para ordenar as amostras, identificar o FMC e medir CPU.
     # cpu_percent fica como dado bruto; os cálculos usam cpu_pct_host já normalizado.
@@ -460,7 +516,9 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
     # Se ela não vier, não tentamos deduzi-la pelo uptime: marcamos como desconhecida.
     df["fase"] = df["fase"].fillna("NAO_DETERMINADA").astype(str).str.strip()
     df.loc[df["fase"].eq(""), "fase"] = "NAO_DETERMINADA"
+
     # Liga hostname -> computador/aeronave/empresa e traz os limites de cada computador.
+
     df = _vincular_cadastro(df, cadastro, componentes)
     # Compara cada métrica com os limites do próprio computador (cadastrados pelo gestor).
     # Sem limite configurado, a métrica não recebe estado de alerta inventado.
@@ -560,22 +618,26 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
     df = df.drop(columns=["_reinicio", "_chave_host"])
     df.attrs["duplicatas_descartadas"] = quantidade_duplicadas
     return df
-# ============================================================
-# 4. FUNÇÕES AUXILIARES GOLD
-# ============================================================
-def regressao_linear(x: pd.Series, y: pd.Series, minimo_pontos: int = 3) -> float:
+
+# FUNÇÕES AUXILIARES GOLD
+
+def regressao_linear(x: pd.Series, y: pd.Series, minimo_pontos: int = 3) -> float: # -> é para falar oq será retornado pelo def
     # Calcula a tendência linear de y ao longo do tempo; exige pontos distintos.
     # Remove valores inválidos antes do cálculo, para não contaminar a inclinação.
     dados = pd.DataFrame({"x": x, "y": y}).replace([np.inf, -np.inf], np.nan).dropna()
     if len(dados) < minimo_pontos or dados["x"].nunique() < 2:
         return np.nan
+    
     return float(np.polyfit(dados["x"].astype(float), dados["y"].astype(float), 1)[0])
-def percentual_acima(serie: pd.Series, limite: float) -> float:
+
+def percentual_acima(serie: pd.Series, limite: float) -> float: # -> é para falar oq será retornado pelo def
     # Percentual acima do limite entre valores válidos; sem dados, retorna NaN.
     valores_validos = pd.to_numeric(serie, errors="coerce").dropna()
     if valores_validos.empty:
         return np.nan
+    
     return float((valores_validos > limite).mean() * 100)
+
 def _limiar_valido(limiares: dict, metrica: str):
     # Só aceita um par numérico completo em que atenção seja menor que crítico.
     limites = limiares.get(metrica)
@@ -587,7 +649,9 @@ def _limiar_valido(limiares: dict, metrica: str):
         return None
     if not np.isfinite(atencao) or not np.isfinite(critico) or atencao >= critico:
         return None
+    
     return atencao, critico
+
 def _limites_do_grupo(grupo: pd.DataFrame, metrica: str):
     # Lê os limites do próprio computador, gravados na Silver; sem par único e válido, não há limite.
     vazio = pd.Series(dtype=float)
@@ -596,9 +660,10 @@ def _limites_do_grupo(grupo: pd.DataFrame, metrica: str):
     if len(atencao) != 1 or len(critico) != 1:
         return None
     return _limiar_valido({metrica: (atencao[0], critico[0])}, metrica)
-def _calcular_health_score(grupo: pd.DataFrame, completude: float) -> tuple[float, str, float, float]:
-    # Score por severidade máxima por amostra; crítico não acumula também atenção.
-    # Primeiro identifica quais métricas têm limites válidos para esta execução.
+
+def _calcular_health_score(grupo: pd.DataFrame, completude: float) -> tuple[float, str, float, float]: # -> é para falar oq será retornado pelo def
+    # Score por severidade máxima por amostra; crítico não acumula atenção também.
+    # Primeiro identifica quais métricas têm limites válidos para execução.
     metricas_configuradas = [
         metrica for metrica in METRICAS_ALERTAVEIS if _limites_do_grupo(grupo, metrica)
     ]
@@ -627,9 +692,11 @@ def _calcular_health_score(grupo: pd.DataFrame, completude: float) -> tuple[floa
         + PESO_CRITICO * pct_critico
         + max(0.0, 100.0 - float(completude)) * PENALIDADE_COMPLETUDE_POR_PONTO
     )
+
     score = max(0.0, min(100.0, 100.0 - penalidade))
     return round(score, 1), "OK", round(pct_atencao, 2), round(pct_critico, 2)
-def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict) -> dict:
+
+def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict) -> dict: # -> é para falar oq será retornado pelo def
     # Calcula indicadores da sessão sem mascarar ausência de dados ou intervalos desconhecidos.
     grupo = grupo.sort_values("ts").reset_index(drop=True)
     total_amostras = len(grupo)
@@ -690,11 +757,12 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict) -> dict:
         "flash_media_pct": round(flash_pct.mean(), 2) if flash_pct.notna().any() else np.nan,
         "flash_max_pct": round(flash_pct.max(), 2) if flash_pct.notna().any() else np.nan,
     }
+
     inclinacao_ram = regressao_linear(grupo["t_sessao_s"], ram_bytes, minimo_pontos=3)
     kpis["ram_tendencia_kb_h"] = (
         round(inclinacao_ram * 3600 / BYTES_POR_KB, 4)
-        if pd.notna(inclinacao_ram) else np.nan
-    )
+        if pd.notna(inclinacao_ram) else np.nan)
+
     # Projeção de preenchimento do arquivo/log observado, não vida útil física da memória Flash.
     flash = grupo[["t_sessao_s", "flash_usada_bytes", "flash_total_bytes"]].copy()
     flash = flash.replace([np.inf, -np.inf], np.nan).dropna().sort_values("t_sessao_s")
@@ -706,15 +774,17 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict) -> dict:
         sem_reset = bool((deltas_flash >= 0).all())
         if tempo_decorrido > 0 and sem_reset:
             taxa_regressao = regressao_linear(
-                flash["t_sessao_s"], flash["flash_usada_bytes"], minimo_pontos=2
-            )
+                flash["t_sessao_s"], flash["flash_usada_bytes"], minimo_pontos=2)
+            
             if pd.notna(taxa_regressao) and taxa_regressao > 0:
                 flash_taxa_bps = float(taxa_regressao)
                 capacidade = pd.to_numeric(flash["flash_total_bytes"], errors="coerce").dropna()
                 ultimo_usado = float(flash["flash_usada_bytes"].iloc[-1])
+
                 if len(capacidade) and float(capacidade.iloc[-1]) > 0:
                     bytes_restantes = max(0.0, float(capacidade.iloc[-1]) - ultimo_usado)
                     flash_autonomia_h = bytes_restantes / flash_taxa_bps / 3600
+
     kpis["flash_taxa_kbps"] = round(flash_taxa_bps / BYTES_POR_KB, 6) if pd.notna(flash_taxa_bps) else np.nan
     kpis["flash_capacidade_restante_h"] = round(flash_autonomia_h, 3) if pd.notna(flash_autonomia_h) else np.nan
     # Alias de nome antigo mantido para não quebrar dashboards que já leem esse KPI.
@@ -727,9 +797,9 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict) -> dict:
     kpis["health_pct_amostras_atencao"] = pct_atencao
     kpis["health_pct_amostras_criticas"] = pct_critico
     return kpis
-# ============================================================
-# 5. ALERTAS COM PERSISTÊNCIA, HISTERESE E HISTÓRICO AUDITÁVEL
-# ============================================================
+
+# ALERTAS COM PERSISTÊNCIA, HISTERESE E HISTÓRICO AUDITÁVEL
+
 def _registro_evento_alerta(identificadores, metrica, tipo_evento, nivel, valor,
                             limiar_violado, ts_abertura, linha_evento, fase_abertura,
                             alerta_id, ts_encerramento=None, duracao_s=np.nan):
@@ -749,20 +819,23 @@ def _registro_evento_alerta(identificadores, metrica, tipo_evento, nivel, valor,
         "fase_evento": str(linha_evento.get("fase", "NAO_DETERMINADA")),
         "em_aberto_apos_evento": tipo_evento != "ENCERRAMENTO",
     }
+
 def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
     # Gera eventos de abertura, escala, rebaixamento e encerramento de alertas.
     registros = []
     colunas_saida = [
         *CHAVES_AGRUPAMENTO, "alerta_id", "metrica", "tipo_evento", "nivel", "valor",
         "limiar_violado", "ts_abertura", "ts_evento", "ts_encerramento", "duracao_s",
-        "fase", "fase_evento", "em_aberto_apos_evento",
-    ]
+        "fase", "fase_evento", "em_aberto_apos_evento",]
+    
     for chave, grupo_original in df_silver.groupby(CHAVES_AGRUPAMENTO, dropna=False, sort=False):
         chave = chave if isinstance(chave, tuple) else (chave,)
         identificadores = dict(zip(CHAVES_AGRUPAMENTO, chave))
         grupo = grupo_original.sort_values("ts").reset_index(drop=True)
+
         for metrica in METRICAS_ALERTAVEIS:
             limites = _limites_do_grupo(grupo, metrica)
+
             if limites is None:
                 continue
             limite_atencao, limite_critico = limites
@@ -774,6 +847,7 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
             nivel_pendente = None
             contador_pendente = 0
             indice_inicio_pendente = None
+
             for i, linha in grupo.iterrows():
                 valor = pd.to_numeric(pd.Series([linha.get(metrica)]), errors="coerce").iloc[0]
                 dt = linha.get("dt_s", np.nan)
@@ -783,15 +857,17 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                 intervalo_consecutivo = (
                     i == 0 or (
                         intervalo_valido and pd.notna(dt) and float(dt) > 0
-                        and float(dt) <= float(intervalo) * 1.5 and not lacuna
-                    )
+                        and float(dt) <= float(intervalo) * 1.5 and not lacuna)
                 )
+                
                 if not intervalo_consecutivo:
                     nivel_pendente = None
                     contador_pendente = 0
                     indice_inicio_pendente = None
+
                 nivel_fonte = linha.get(col_nivel)
                 nivel_atual = str(nivel_fonte) if nivel_fonte in ("ATENCAO", "CRITICO") else None
+
                 if pd.isna(valor):
                     nivel_pendente = None
                     contador_pendente = 0
@@ -821,6 +897,7 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                             identificadores, metrica, "ABERTURA", nivel_ativo, valor, limiar,
                             ts_abertura, linha, fase_abertura, alerta_id,
                         ))
+
                         nivel_pendente = None
                         contador_pendente = 0
                         indice_inicio_pendente = None
@@ -840,6 +917,7 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                                 identificadores, metrica, "ESCALONAMENTO", "CRITICO", valor,
                                 limite_critico, ts_abertura, linha, fase_abertura, alerta_id,
                             ))
+
                             nivel_pendente = None
                             contador_pendente = 0
                             indice_inicio_pendente = None
@@ -854,6 +932,7 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                                 limite_atencao, ts_abertura, linha, fase_abertura, alerta_id,
                                 ts_encerramento=linha["ts"], duracao_s=duracao,
                             ))
+
                             nivel_ativo, ts_abertura, fase_abertura, alerta_id = None, None, None, None
                 else:  # alerta CRITICO
                     # A histerese evita alternar de nível quando o valor fica perto do limite.
@@ -867,6 +946,7 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                                 identificadores, metrica, "REBAIXAMENTO", "ATENCAO", valor,
                                 limite_atencao, ts_abertura, linha, fase_abertura, alerta_id,
                             ))
+
                         else:
                             duracao = (linha["ts"] - ts_abertura).total_seconds() if ts_abertura is not None else np.nan
                             registros.append(_registro_evento_alerta(
@@ -874,14 +954,16 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                                 limite_critico, ts_abertura, linha, fase_abertura, alerta_id,
                                 ts_encerramento=linha["ts"], duracao_s=duracao,
                             ))
+
                             nivel_ativo, ts_abertura, fase_abertura, alerta_id = None, None, None, None
+
     resultado = pd.DataFrame(registros, columns=colunas_saida)
     if not resultado.empty:
         resultado = resultado.sort_values(["ts_evento", "alerta_id"], kind="mergesort").reset_index(drop=True)
     return resultado
-# ============================================================
-# 6. KPIs GOLD POR FASE, SESSÃO E MINUTO
-# ============================================================
+
+# KPIs GOLD POR FASE, SESSÃO E MINUTO
+
 def calcular_kpis_por_fase(df_silver: pd.DataFrame) -> pd.DataFrame:
     # Resume métricas por fase; fases não modeladas não recebem baseline inventado.
     chaves = CHAVES_AGRUPAMENTO + ["fase"]
@@ -897,8 +979,10 @@ def calcular_kpis_por_fase(df_silver: pd.DataFrame) -> pd.DataFrame:
             lacunas=("q_lacuna", lambda valores: valores.sum(min_count=1)),
             amostras_ausentes_estimadas=("q_amostras_ausentes", lambda valores: valores.sum(min_count=1)),
         )
+
         .reset_index()
     )
+
     for coluna in ("cpu_media", "cpu_pico", "ram_media", "flash_media"):
         resultado[coluna] = resultado[coluna].round(2)
     mapa_cpu_esperada = {nome: cpu for nome, _, cpu, _ in FASES_VOO}
@@ -908,6 +992,7 @@ def calcular_kpis_por_fase(df_silver: pd.DataFrame) -> pd.DataFrame:
     resultado["cpu_desvio_esperado"] = (resultado["cpu_media"] - resultado["cpu_esperado"]).round(2)
     resultado["ram_desvio_esperado"] = (resultado["ram_media"] - resultado["ram_esperada"]).round(2)
     return resultado
+
 def processar_camada_gold(df_silver: pd.DataFrame, componentes=None):
     # Cria KPIs por sessão, série por minuto, KPIs por fase e eventos de alerta.
     kpis_sessao = []
@@ -922,6 +1007,7 @@ def processar_camada_gold(df_silver: pd.DataFrame, componentes=None):
             CHAVES_AGRUPAMENTO + ["fase", pd.Grouper(key="ts", freq="1min")],
             dropna=False, observed=True,
         )
+
         .agg(
             amostras=("ts", "count"),
             cpu_media=("cpu_pct", "mean"),
@@ -931,13 +1017,17 @@ def processar_camada_gold(df_silver: pd.DataFrame, componentes=None):
         )
         .reset_index()
     )
+
     for coluna in ("cpu_media", "ram_media", "flash_media"):
         df_serie_1min[coluna] = df_serie_1min[coluna].round(3)
     df_kpis_fase = calcular_kpis_por_fase(df_silver)
     df_alertas = vincular_componente_alertas(gerar_alertas(df_silver), componentes)
+
     return df_kpis_sessao, df_serie_1min, df_kpis_fase, df_alertas
+
 def _chave_normalizada(linha: pd.Series, colunas: list[str]) -> tuple:
     return tuple(None if pd.isna(linha.get(coluna)) else str(linha.get(coluna)) for coluna in colunas)
+
 def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_alertas: pd.DataFrame) -> pd.DataFrame:
     # Consolida último estado, health score e quantidade/severidade dos alertas por FMC.
     # Repassa os eventos na ordem do tempo para saber quais alertas continuam abertos.
@@ -946,6 +1036,7 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_a
         "completude_pct", "health_score", "health_score_status", "alertas_abertos",
         "alertas_criticos_abertos", "alertas_atencao_abertos", "estado_saude",
     ]
+
     ativos = {}
     if not df_alertas.empty:
         for _, evento in df_alertas.sort_values("ts_evento", kind="mergesort").iterrows():
@@ -959,6 +1050,7 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_a
             elif tipo == "ENCERRAMENTO":
                 ativos.pop(chave_alerta, None)
     linhas = []
+
     for _, grupo in df_silver.groupby(CHAVES_FMC, dropna=False, sort=False):
         grupo = grupo.sort_values("ts")
         ultima = grupo.iloc[-1]
@@ -973,12 +1065,15 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_a
                     candidatos = candidatos[candidatos[coluna].isna()]
                 else:
                     candidatos = candidatos[candidatos[coluna].astype(str).eq(str(valor))]
+
             if not candidatos.empty:
                 kpi = candidatos.sort_values("fim").iloc[-1]
+
         criticos = sum(1 for alerta in abertos if alerta["nivel"] == "CRITICO")
         atencao = sum(1 for alerta in abertos if alerta["nivel"] == "ATENCAO")
         health = kpi.get("health_score", np.nan) if not kpi.empty else np.nan
         health_status = kpi.get("health_score_status", "DADOS_INSUFICIENTES") if not kpi.empty else "DADOS_INSUFICIENTES"
+
         if criticos:
             estado = "CRITICO"
         elif atencao:
@@ -987,6 +1082,7 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_a
             estado = "DADOS_INSUFICIENTES"
         else:
             estado = "SEM_ALERTAS_ATIVOS"
+        
         linhas.append({
             **{coluna: ultima.get(coluna, np.nan) for coluna in CHAVES_FMC},
             "ultima_amostra_utc": ultima["ts"].isoformat(),
@@ -1001,8 +1097,10 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_a
             "alertas_atencao_abertos": atencao,
             "estado_saude": estado,
         })
+
     return pd.DataFrame(linhas, columns=colunas_saida)
-# 7. UPLOAD OPCIONAL PARA S3
+
+# UPLOAD OPCIONAL PARA S3
 
 def enviar_arquivos_s3(caminhos_locais: list, prefixo: str, hostname: str, sessao_id: str) -> None:
     #Envia Silver/Gold com chaves por host e sessão.
@@ -1047,6 +1145,7 @@ def enviar_arquivos_s3(caminhos_locais: list, prefixo: str, hostname: str, sessa
 
 
 # EXECUÇÃO DO PIPELINE
+
 if __name__ == "__main__":
     terminal = argparse.ArgumentParser(
         description="Pipeline ETL AirPulse: Bronze no local ou S3 -> Silver -> Gold"
@@ -1125,26 +1224,28 @@ if __name__ == "__main__":
                 raise SystemExit(f"Arquivo Bronze local '{caminho_local}' não existe.")
             print(f"Lendo Bronze local: {caminho_local}")
             df_bronze = pd.read_csv(caminho_local, sep=";", encoding="utf-8")
+
             if df_bronze.empty:
                 raise SystemExit("O arquivo Bronze existe, mas não contém amostras.")
+            
             local_origem = str(caminho_local)
             # Usa uma sessão explícita do CSV, se possível; senão, associa os resultados à execução.
             sessoes = (
                 df_bronze["sessao_origem"].dropna().astype(str).unique().tolist()
                 if "sessao_origem" in df_bronze.columns else []
             )
+
             sessao_resultado = sessoes[0] if len(sessoes) == 1 else datetime.now().strftime("%Y%m%dT%H%M%S")
             # Se o estado local contiver os novos campos, reaproveita a referência de sessão.
             try:
                 with open(ARQUIVO_ESTADO_BRONZE, encoding="utf-8") as arquivo_estado:
                     estado_local = json.load(arquivo_estado)
-                if (
-                    isinstance(estado_local, dict)
+                if (isinstance(estado_local, dict)
                     and estado_local.get("arquivo_bronze")
-                    and os.path.abspath(estado_local["arquivo_bronze"]) == os.path.abspath(caminho_local)
-                ):
+                    and os.path.abspath(estado_local["arquivo_bronze"]) == os.path.abspath(caminho_local)):
                     manifesto = estado_local
                     sessao_resultado = str(estado_local.get("sessao_id") or sessao_resultado)
+
             except (OSError, json.JSONDecodeError):
                 pass
 
@@ -1169,6 +1270,7 @@ if __name__ == "__main__":
             f"ATENÇÃO: {int(nao_cadastrado.sum())} amostra(s) de hostname não cadastrado "
             f"({hosts}) enviadas para {caminho_quarentena}."
         )
+
         df_silver = df_silver[~nao_cadastrado].reset_index(drop=True)
     if df_silver.empty:
         raise SystemExit(
@@ -1192,6 +1294,7 @@ if __name__ == "__main__":
         PASTA_GOLD / "gold_alertas.json": anexar_cadastro(df_alertas, df_silver),
         PASTA_GOLD / "gold_resumo_fmc.json": anexar_cadastro(df_resumo_fmc, df_silver),
     }
+
     for caminho, dados in arquivos_gold.items():
         dados.to_json(caminho, orient="records", date_format="iso",
                     force_ascii=False, indent=2)
@@ -1203,6 +1306,7 @@ if __name__ == "__main__":
         "completude_pct", "cpu_media", "cpu_p95", "ram_media", "ram_tendencia_kb_h",
         "flash_autonomia_h", "health_score", "health_score_status",
     ]
+    
     colunas_presentes = [coluna for coluna in colunas_resumo if coluna in df_sessao.columns]
     print("\nResumo Gold por sessão:")
     print(df_sessao[colunas_presentes].to_string(index=False))
