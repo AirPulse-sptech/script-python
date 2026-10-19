@@ -194,7 +194,6 @@ FASES_VOO = [
 ]
 # A fundamentação explicita 70%/85% para CPU, não para as outras métricas.
 # Outras métricas só recebem limiares se configuradas pelo banco.
-LIMITES_PADRAO = {"cpu_pct": (70.0, 85.0)}
 PERSISTENCIA_AMOSTRAS = 3
 HISTERESE_PTS = 5.0
 PESO_ATENCAO = 0.5
@@ -203,13 +202,11 @@ PENALIDADE_COMPLETUDE_POR_PONTO = 0.3
 MIN_AMOSTRAS_HEALTH = 3  # Decisão conservadora de implementação; não é requisito textual.
 # A identidade do equipamento é só o hostname (= computador.nome cadastrado pelo gestor).
 # Empresa, aeronave e placas são resolvidas depois, por join com o cadastro.
-CHAVES_BASE = ["hostname"]
+CHAVES_BASE = ["hostname", "placa_numero_serie"]
 CHAVES_AGRUPAMENTO = CHAVES_BASE + ["sessao"]
-CHAVES_FMC = ["hostname"]
+CHAVES_FMC = ["hostname"]  
 BYTES_POR_KB = 1024
 METRICAS_ALERTAVEIS = ("cpu_pct", "ram_pct", "flash_pct")
-CHAVES_BASE = ["hostname", "placa_numero_serie"]
-CHAVES_FMC = ["hostname"]   # resumo continua por FMC
 
 # CADASTRO DO MYSQL: hostname -> computador -> aeronave -> empresa -> placas e limites
 # Premissa do projeto: computador.nome é o hostname da máquina e é único.
@@ -239,6 +236,11 @@ SQL_COMPONENTES = (
 def _chave_hostname(serie: pd.Series) -> pd.Series: 
     # Compara hostnames sem diferenciar maiúsculas/minúsculas (Windows costuma devolver em MAIÚSCULAS).
     return serie.astype(str).str.strip().str.lower()
+
+def _chave_placa(serie: pd.Series) -> pd.Series:
+    # Série vazia ou nula vira NaN: nunca casa com nenhuma placa cadastrada.
+    texto = serie.astype(str).str.strip().str.lower()
+    return texto.where(serie.notna() & texto.ne(""), np.nan)
 
 def carregar_cadastro_do_banco():
     # Devolve (df_cadastro, df_componentes). Se o banco não responder, devolve (None, None):
@@ -275,8 +277,8 @@ def carregar_cadastro_do_banco():
         cadastro[coluna] = cadastro[coluna].astype("Int64")
 
     componentes = pd.DataFrame(linhas_componentes, columns=[
-        "hostname", "componente_id", "tipo", "placa_id", "placa_nome", "limiteAtencao", "limiteCritico",
-    ])
+    "hostname", "componente_id", "tipo", "placa_id", "placa_nome",
+    "placa_numero_serie", "limiteAtencao", "limiteCritico",])
 
     componentes["metrica"] = componentes["tipo"].astype(str).str.upper().map(MAPA_TIPO_METRICA)
 
@@ -292,6 +294,7 @@ def carregar_cadastro_do_banco():
 def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame: # -> é para falar oq será retornado pelo def
     # Liga cada amostra ao cadastro pelo hostname e traz os limites de cada computador.
     df["_chave_host"] = _chave_hostname(df["hostname"])
+    df["_chave_placa"] = _chave_placa(df["placa_numero_serie"])
     if cadastro is None:
         for coluna in COLUNAS_CADASTRO:
             df[coluna] = np.nan
@@ -317,17 +320,22 @@ def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame:
         df[f"limiar_{metrica}_critico"] = np.nan
 
     if componentes is not None and not componentes.empty:
-        lim = componentes.assign(_chave_host=_chave_hostname(componentes["hostname"]))
+        lim = componentes.assign(
+            _chave_host=_chave_hostname(componentes["hostname"]),
+            _chave_placa=_chave_placa(componentes["placa_numero_serie"]),)
+        
+        lim = lim.dropna(subset=["_chave_placa"])
 
         for metrica in METRICAS_ALERTAVEIS:
-            do_host = lim[lim["metrica"] == metrica].groupby("_chave_host")[["limiteAtencao", "limiteCritico"]].mean()
-            df[f"limiar_{metrica}_atencao"] = pd.to_numeric(df["_chave_host"].map(do_host["limiteAtencao"]), errors="coerce")
-            df[f"limiar_{metrica}_critico"] = pd.to_numeric(df["_chave_host"].map(do_host["limiteCritico"]), errors="coerce")
-
-    for metrica, (padrao_atencao, padrao_critico) in LIMITES_PADRAO.items():
-        sem_limite = df[f"limiar_{metrica}_atencao"].isna() | df[f"limiar_{metrica}_critico"].isna()
-        df.loc[sem_limite, f"limiar_{metrica}_atencao"] = padrao_atencao
-        df.loc[sem_limite, f"limiar_{metrica}_critico"] = padrao_critico
+            do_tipo = lim[lim["metrica"] == metrica].drop_duplicates(["_chave_host", "_chave_placa"])
+            ref_limites = do_tipo[["_chave_host", "_chave_placa", "limiteAtencao", "limiteCritico"]].rename(
+                columns={
+                    "limiteAtencao": f"limiar_{metrica}_atencao",
+                    "limiteCritico": f"limiar_{metrica}_critico",
+                }
+            )
+            df = df.drop(columns=[f"limiar_{metrica}_atencao", f"limiar_{metrica}_critico"])
+            df = df.merge(ref_limites, on=["_chave_host", "_chave_placa"], how="left")
 
     for metrica in METRICAS_ALERTAVEIS:
         colunas = [f"limiar_{metrica}_atencao", f"limiar_{metrica}_critico"]
@@ -358,15 +366,21 @@ def vincular_componente_alertas(df_alertas: pd.DataFrame, componentes) -> pd.Dat
             df_alertas[coluna] = np.nan
         return df_alertas
     
-    comp = componentes[["hostname", "metrica", *novas]].copy()
-
+    comp = componentes[["hostname", "metrica", "placa_numero_serie", *novas]].copy()
     comp["_chave_host"] = _chave_hostname(comp["hostname"])
+    comp["_chave_placa"] = _chave_placa(comp["placa_numero_serie"])
+    comp = comp.dropna(subset=["_chave_placa"])
+    comp = comp.drop(columns=["hostname", "placa_numero_serie"])
+    comp = comp.drop_duplicates(["_chave_host", "_chave_placa", "metrica"])
 
-    comp = comp.drop(columns="hostname").drop_duplicates(["_chave_host", "metrica"])
+    saida = df_alertas.assign( #Assign cria novas colunas pro df original
+        _chave_host=_chave_hostname(df_alertas["hostname"]),
+        _chave_placa=_chave_placa(df_alertas["placa_numero_serie"]),
+    )
 
-    saida = df_alertas.assign(_chave_host=_chave_hostname(df_alertas["hostname"]))
+    saida = saida.merge(comp, on=["_chave_host", "_chave_placa", "metrica"], how="left")
 
-    return saida.merge(comp, on=["_chave_host", "metrica"], how="left").drop(columns="_chave_host")
+    return saida.drop(columns=["_chave_host", "_chave_placa"])
 
 def _garantir_coluna(df: pd.DataFrame, nome: str, valor_padrao=np.nan) -> None: # -> é para falar oq será retornado pelo def
     if nome not in df.columns:
@@ -400,7 +414,7 @@ def _inferir_intervalo(grupo: pd.DataFrame) -> tuple[float, str]: # -> é para f
 # BRONZE -> SILVER: VALIDAÇÃO, TIPAGEM, QUALIDADE E DERIVAÇÕES
 
 def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=None) -> pd.DataFrame: # -> é para falar oq será retornado pelo def
-    # Transforma Bronze sem preencher métricas/identidades desconhecidas com valores falsos.
+    # Transforma Bronze sem preencher métricas ou identidades desconhecidas com valores mentirosos.
     if not isinstance(df_bronze, pd.DataFrame):
         raise TypeError("Bronze deve ser um pandas.DataFrame.")
     
@@ -458,6 +472,7 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
         "ram_usada_bytes", "ram_baseline_bytes", "ram_total_bytes", "ram_disponivel_bytes", "flash_usada_bytes",
         "flash_total_bytes", "qtd_tarefas", "intervalo_coleta_s",
     ]
+
     for coluna in colunas_numericas:
         df[coluna] = pd.to_numeric(df[coluna], errors="coerce")
     # Número de núcleos precisa ser positivo; zero ou negativo não é um valor válido.
@@ -617,6 +632,7 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
     # Coluna auxiliar interna não precisa ir à Silver persistida.
     df = df.drop(columns=["_reinicio", "_chave_host"])
     df.attrs["duplicatas_descartadas"] = quantidade_duplicadas
+    df = df.drop(columns=["_reinicio", "_chave_host", "_chave_placa"])
     return df
 
 # FUNÇÕES AUXILIARES GOLD
@@ -891,7 +907,12 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                         primeira = grupo.iloc[indice_inicio_pendente]
                         ts_abertura = primeira["ts"]
                         fase_abertura = str(primeira.get("fase", "NAO_DETERMINADA"))
-                        alerta_id = f"{identificadores.get('hostname')}:{metrica}:{ts_abertura.isoformat()}"
+
+                        alerta_id = (
+                        f"{identificadores.get('hostname')}:{identificadores.get('placa_numero_serie')}"
+                        f":{metrica}:{ts_abertura.isoformat()}"
+                        )
+                        
                         limiar = limite_critico if nivel_ativo == "CRITICO" else limite_atencao
                         registros.append(_registro_evento_alerta(
                             identificadores, metrica, "ABERTURA", nivel_ativo, valor, limiar,
