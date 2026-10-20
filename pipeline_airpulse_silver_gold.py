@@ -203,7 +203,7 @@ PENALIDADE_COMPLETUDE_POR_PONTO = 0.3
 MIN_AMOSTRAS_HEALTH = 3  # Decisão conservadora de implementação; não é requisito textual.
 # A identidade do equipamento é só o hostname (= computador.nome cadastrado pelo gestor).
 # Empresa, aeronave e placas são resolvidas depois, por join com o cadastro.
-CHAVES_BASE = ["hostname", "placa_numero_serie"]
+CHAVES_BASE = ["hostname", "placa_nome"]
 CHAVES_AGRUPAMENTO = CHAVES_BASE + ["sessao"]
 CHAVES_FMC = ["hostname"]  
 BYTES_POR_KB = 1024
@@ -227,7 +227,7 @@ SQL_CADASTRO = (
 )
 
 SQL_COMPONENTES = (
-    "SELECT c.hostname, co.idComponente, co.tipo, p.idPlaca, p.nome, p.numeroSerie, "
+    "SELECT c.hostname, co.idComponente, co.tipo, p.idPlaca, p.nome,"
     "co.limiteAtencao, co.limiteCritico "
     "FROM componente co "
     "JOIN placa p ON p.idPlaca = co.fkPlaca "
@@ -255,23 +255,23 @@ def carregar_placas_do_banco(hostname):
         try:
             with con.cursor() as cur:
                 cur.execute(
-                    "SELECT p.numeroSerie, co.tipo FROM placa p "
+                    "SELECT p.nome, co.tipo FROM placa p "
                     "JOIN computador c ON c.idComputador = p.fkComputador "
                     "JOIN componente co ON co.fkPlaca = p.idPlaca "
-                    "WHERE LOWER(c.nome) = LOWER(%s) AND co.statusMonitoramento = 'ATIVO'", (hostname,))
+                    "WHERE LOWER(c.hostname) = LOWER(%s) AND co.statusMonitoramento = 'ATIVO'", (hostname,))
                 linhas = cur.fetchall()
         finally:
             con.close()
     except Exception as erro:
         raise SystemExit(f"Não foi possível ler as placas no MySQL: {erro}")
-    por_serie = {}
-    for serie, tipo in linhas:
+    por_nome = {}
+    for nome, tipo in linhas:
         tipo = "DISCO" if str(tipo).upper() == "FLASH" else str(tipo).upper()
-        if serie and tipo in ("CPU", "RAM", "DISCO"):
-            por_serie.setdefault(str(serie).strip(), set()).add(tipo)
-    if not por_serie:
+        if nome and tipo in ("CPU", "RAM", "DISCO"):
+            por_nome.setdefault(str(nome).strip(), set()).add(tipo)
+    if not por_nome:
         raise SystemExit(f"Hostname '{hostname}' sem placa ativa no cadastro.")
-    return [{"serie": s, "componentes": c} for s, c in por_serie.items()]
+    return [{"nome": s, "componentes": c} for s, c in por_nome.items()]
 
 def carregar_cadastro_do_banco():
     # Devolve (df_cadastro, df_componentes). Se o banco não responder, devolve (None, None):
@@ -309,7 +309,7 @@ def carregar_cadastro_do_banco():
 
     componentes = pd.DataFrame(linhas_componentes, columns=[
     "hostname", "componente_id", "tipo", "placa_id", "placa_nome",
-    "placa_numero_serie", "limiteAtencao", "limiteCritico",])
+    "limiteAtencao", "limiteCritico",])
 
     componentes["metrica"] = componentes["tipo"].astype(str).str.upper().map(MAPA_TIPO_METRICA)
 
@@ -325,7 +325,7 @@ def carregar_cadastro_do_banco():
 def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame: # -> é para falar oq será retornado pelo def
     # Liga cada amostra ao cadastro pelo hostname e traz os limites de cada computador.
     df["_chave_host"] = _chave_hostname(df["hostname"])
-    df["_chave_placa"] = _chave_placa(df["placa_numero_serie"])
+    df["_chave_placa"] = _chave_placa(df["placa_nome"])
     if cadastro is None:
         for coluna in COLUNAS_CADASTRO:
             df[coluna] = np.nan
@@ -353,7 +353,7 @@ def _vincular_cadastro(df: pd.DataFrame, cadastro, componentes) -> pd.DataFrame:
     if componentes is not None and not componentes.empty:
         lim = componentes.assign(
             _chave_host=_chave_hostname(componentes["hostname"]),
-            _chave_placa=_chave_placa(componentes["placa_numero_serie"]),)
+            _chave_placa=_chave_placa(componentes["placa_nome"]),)
         
         lim = lim.dropna(subset=["_chave_placa"])
 
@@ -391,22 +391,23 @@ def anexar_cadastro(df_gold: pd.DataFrame, df_silver: pd.DataFrame) -> pd.DataFr
 
 def vincular_componente_alertas(df_alertas: pd.DataFrame, componentes) -> pd.DataFrame:  # -> é para falar oq será retornado pelo def
     # Liga cada alerta ao componente e à placa monitorados (cpu->CPU, ram->RAM, flash->DISCO).
-    novas = ["componente_id", "placa_id", "placa_nome"]
+    novas = ["componente_id", "placa_id"]
+
     if componentes is None or componentes.empty or df_alertas.empty:
         for coluna in novas:
             df_alertas[coluna] = np.nan
         return df_alertas
     
-    comp = componentes[["hostname", "metrica", "placa_numero_serie", *novas]].copy()
+    comp = componentes[["hostname", "metrica", "placa_nome", *novas]].copy()
     comp["_chave_host"] = _chave_hostname(comp["hostname"])
-    comp["_chave_placa"] = _chave_placa(comp["placa_numero_serie"])
+    comp["_chave_placa"] = _chave_placa(comp["placa_nome"])
     comp = comp.dropna(subset=["_chave_placa"])
-    comp = comp.drop(columns=["hostname", "placa_numero_serie"])
+    comp = comp.drop(columns=["hostname", "placa_nome"])
     comp = comp.drop_duplicates(["_chave_host", "_chave_placa", "metrica"])
 
     saida = df_alertas.assign( #Assign cria novas colunas pro df original
         _chave_host=_chave_hostname(df_alertas["hostname"]),
-        _chave_placa=_chave_placa(df_alertas["placa_numero_serie"]),
+        _chave_placa=_chave_placa(df_alertas["placa_nome"]),
     )
 
     saida = saida.merge(comp, on=["_chave_host", "_chave_placa", "metrica"], how="left")
@@ -480,7 +481,7 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
     df["fase"] = df["fase"].astype("object")
     _garantir_coluna(df, "modo_execucao", "desconhecido")
     _garantir_coluna(df, "intervalo_coleta_s", np.nan)
-    _garantir_coluna(df, "cpu_percent", np.nan)  # Mantém a leitura bruta para auditoria.
+    _garantir_coluna(df, "cpu_percent", np.nan)  # Mantém a leitura bruta para poder fazer auditoria.
     _garantir_coluna(df, "cpu_nucleos", np.nan)
     _garantir_coluna(df, "cpu_semantica", np.nan)
     _garantir_coluna(df, "cpu_pct_host", np.nan)
@@ -663,7 +664,7 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
     # Coluna auxiliar interna não precisa ir à Silver persistida.
     df = df.drop(columns=["_reinicio", "_chave_host"])
     df.attrs["duplicatas_descartadas"] = quantidade_duplicadas
-    df = df.drop(columns=["_reinicio", "_chave_host", "_chave_placa"])
+    df = df.drop(columns=["_chave_placa"])
     return df
 
 # FUNÇÕES AUXILIARES GOLD
@@ -724,9 +725,9 @@ def _calcular_health_score(grupo: pd.DataFrame, completude: float) -> tuple[floa
         serie = pd.to_numeric(grupo[metrica], errors="coerce")
         limite_atencao, limite_critico = _limites_do_grupo(grupo, metrica)
         valido = serie.notna() & np.isfinite(serie)
-        amostra_valida |= valido
-        critico_algum |= valido & (serie > limite_critico)
-        atencao_alguma |= valido & (serie > limite_atencao) & (serie <= limite_critico)
+        amostra_valida = amostra_valida | valido
+        critico_algum = critico_algum | valido & (serie > limite_critico)
+        atencao_alguma = atencao_alguma | valido & (serie > limite_atencao) & (serie <= limite_critico)
     # Usa só as amostras em que ao menos uma métrica configurada tem valor válido.
     denominador = int(amostra_valida.sum())
     if denominador < MIN_AMOSTRAS_HEALTH:
@@ -940,7 +941,7 @@ def gerar_alertas(df_silver: pd.DataFrame) -> pd.DataFrame:
                         fase_abertura = str(primeira.get("fase", "NAO_DETERMINADA"))
 
                         alerta_id = (
-                        f"{identificadores.get('hostname')}:{identificadores.get('placa_numero_serie')}"
+                        f"{identificadores.get('hostname')}:{identificadores.get('placa_nome')}"
                         f":{metrica}:{ts_abertura.isoformat()}"
                         )
 

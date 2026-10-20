@@ -43,7 +43,7 @@ ARQUIVO_META = "bancada_meta.json"
 # Campos derivados ficam para as camadas seguintes; os aliases repetidos de I/O foram retirados.
 COLUNAS = [
     "timestamp_utc", "seq",
-    "hostname", "placa_numero_serie", "origem", "uptime_proc_s", "fator_tempo", "cpu_percent", "cpu_nucleos",
+    "hostname", "placa_nome", "origem", "uptime_proc_s", "fator_tempo", "cpu_percent", "cpu_nucleos",
     "qtd_tarefas", "ram_usada_bytes", "ram_baseline_bytes", "ram_total_bytes",
     "ram_disponivel_bytes", "flash_usada_bytes", "flash_total_bytes",
     "modo_execucao", "intervalo_coleta_s", "sessao_origem", "fase",
@@ -57,12 +57,12 @@ def carregar_placas(metadados):
     placas = []
     for item in metadados.get("placas") or []:
         try:
-            serie, pid = str(item["numero_serie"]).strip(), int(item["pid"])
+            nome, pid = str(item["placa_nome"]).strip(), int(item["pid"])
         except (KeyError, TypeError, ValueError):
             continue
-        comps = {str(c).upper() for c in item.get("componentes") or []} & {"CPU", "RAM", "DISCO"}
-        if serie and comps:
-            placas.append({"serie": serie, "pid": pid, "componentes": comps,
+        comp = {str(compo).upper() for compo in item.get("componentes") or []} & {"CPU", "RAM", "DISCO"}
+        if nome and comp:
+            placas.append({"nome": nome, "pid": pid, "componentes": comp,
                            "arquivo_flash": item.get("arquivo_flash")})
     return placas
 
@@ -71,7 +71,7 @@ def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline
     a = dict.fromkeys(COLUNAS)  # vazio por padrão: só preenche o que a placa mede
     cpu_bruto, tarefas = medir_cpu_e_tarefas(proc, cache)
     a.update({
-        "timestamp_utc": ts, "hostname": HOSTNAME, "placa_numero_serie": placa["serie"],
+        "timestamp_utc": ts, "hostname": HOSTNAME, "placa_nome": placa["placa_nome"],
         "origem": "SIMULADA_BANCADA", "uptime_proc_s": max(0, int(time.time() - proc.create_time())),
         "fator_tempo": fator_tempo, "qtd_tarefas": tarefas, "modo_execucao": "voo",
         "intervalo_coleta_s": INTERVALO_COLETA_S, "sessao_origem": metadados.get("sessao_origem"),
