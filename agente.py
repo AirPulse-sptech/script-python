@@ -53,17 +53,54 @@ COLUNAS = [
 ]
 
 
+def tipos_validos(lista):
+    tipos = set()
+    for tipo in lista:
+        tipo = str(tipo).strip().upper()
+        if tipo == "FLASH":
+            tipo = "DISCO"
+        if tipo in ("CPU", "RAM", "DISCO"):
+            tipos.add(tipo)
+    return tipos
+
+
 def carregar_placas(metadados):
+    # Placas declaradas no bancada_meta.json (se a bancada gravar). Chave = placa_nome.
     placas = []
     for item in metadados.get("placas") or []:
         try:
             nome, pid = str(item["placa_nome"]).strip(), int(item["pid"])
         except (KeyError, TypeError, ValueError):
             continue
-        comp = {str(compo).upper() for compo in item.get("componentes") or []} & {"CPU", "RAM", "DISCO"}
-        if nome and comp:
-            placas.append({"nome": nome, "pid": pid, "componentes": comp,
+        componentes = tipos_validos(item.get("componentes") or [])
+        if nome and componentes:
+            placas.append({"placa_nome": nome, "pid": pid, "componentes": componentes,
                            "arquivo_flash": item.get("arquivo_flash")})
+    return placas
+
+def carregar_placas_do_env(variavel):
+    # Formato: P01:CPU,RAM,DISCO;P02:RAM;P03:DISCO
+    placas = []
+    for item in os.getenv(variavel, "").split(";"):
+        if ":" not in item:
+            continue
+        nome, tipos = item.split(":", 1)
+        nome = nome.strip()
+        componentes = tipos_validos(tipos.split(","))
+        if nome and componentes:
+            placas.append({"placa_nome": nome, "componentes": componentes})
+    return placas
+
+
+def obter_placas_real(metadados, simulador):
+    # Prioridade: placas do meta da bancada. Sem isso, usa PLACAS_REAL e mede o processo da bancada.
+    placas = carregar_placas(metadados)
+    if placas:
+        return placas
+    placas = carregar_placas_do_env("PLACAS_REAL")
+    for placa in placas:
+        placa["pid"] = simulador.pid
+        placa["arquivo_flash"] = ARQUIVO_FLASH
     return placas
 
 def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram):
@@ -121,6 +158,54 @@ def obter_cliente_s3():
     # Sem chaves explícitas, boto3 usa profile/SSO/variáveis padrão/IAM Role da EC2.
     return boto3.client("s3", **configuracao)
 
+def buscar_placas_do_banco(hostname):
+    # Só leitura. Placas com componente ATIVO no computador cujo hostname = hostname.
+    nomes = []
+    conexao = None
+    try:
+        import pymysql
+        conexao = pymysql.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            database=os.getenv("DB_DATABASE", "airpulse"),
+            user=os.getenv("DB_USER_LEITURA") or os.getenv("DB_USER", ""),
+            password=os.getenv("DB_PASSWORD_LEITURA") or os.getenv("DB_PASSWORD", ""),
+            port=int(os.getenv("DB_PORT", "3306")),
+            connect_timeout=5,
+            read_timeout=5,
+        )
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT p.nome FROM placa p "
+                "JOIN computador c ON c.idComputador = p.fkComputador "
+                "JOIN componente co ON co.fkPlaca = p.idPlaca "
+                "WHERE LOWER(c.hostname) = LOWER(%s) AND co.statusMonitoramento = 'ATIVO' "
+                "ORDER BY p.nome",
+                (hostname,),
+            )
+            for linha in cursor.fetchall():
+                nome = str(linha[0]).strip()
+                if nome and nome not in nomes:
+                    nomes.append(nome)
+    except Exception as erro:
+        print(f"Banco indisponível para listar placas ({erro}).")
+    finally:
+        if conexao is not None:
+            conexao.close()
+    return nomes
+
+
+def carregar_nomes_placas(hostname):
+    # Banco primeiro; se não vier nada, usa PLACAS do .env; senão, vazio (nunca inventa).
+    nomes = buscar_placas_do_banco(hostname)
+    if nomes:
+        return nomes
+    for nome in os.getenv("PLACAS", "").split(","):
+        nome = nome.strip()
+        if nome and nome not in nomes:
+            nomes.append(nome)
+    if nomes:
+        print("Usando PLACAS do .env (banco sem placas para este hostname).")
+    return nomes
 
 def _segmento_s3(valor):
     #Evita barras e caracteres problemáticos em segmentos de chaves S3
@@ -255,7 +340,7 @@ def _normalizar_nome_processo(valor):
     #
     nome = str(valor or "").strip().strip('"').strip("'")
     # Trate caminhos Windows e POSIX mesmo quando o agente roda noutro SO.
-    nome = nome.replace("\\\\", "/").rsplit("/", 1)[-1].casefold()
+    nome = nome.replace("\\", "/").rsplit("/", 1)[-1].casefold()
     if nome.endswith(".py"):
         nome = nome[:-3]
     return "".join(caractere for caractere in nome if caractere.isalnum())
@@ -362,6 +447,17 @@ def detectar_modo_automatico(janela_s=None):
         # Dá alguns segundos para a bancada iniciar, sem pedir um modo no terminal.
         time.sleep(min(0.5, restante))
 
+def obter_placas_real(metadados, simulador, nomes_placas):
+    # Prioridade: placas do meta da bancada. Sem isso, usa os nomes lidos uma vez no início.
+    placas = carregar_placas(metadados)
+    if placas:
+        return placas
+    for nome in nomes_placas:
+        placas.append({"placa_nome": nome, "pid": simulador.pid,
+                       "componentes": COMPONENTES_TODOS, "arquivo_flash": ARQUIVO_FLASH})
+    return placas
+
+
 def rodar_modo_real(simulador_inicial=None):
     print(
     f"Agente AirPulse iniciado no host {HOSTNAME}. "
@@ -374,10 +470,17 @@ def rodar_modo_real(simulador_inicial=None):
         CAMINHO_CSV, "real", hostname=HOSTNAME, sessao_id=SESSAO_EXECUCAO,
         estado_coleta="EM_ANDAMENTO",
     )
-    s3_client = obter_cliente_s3()
+    s3_client = None
+    try:
+        s3_client = obter_cliente_s3()
+    except Exception as erro:
+        print(f"S3 indisponível ({erro}); coleta segue só local.")
+    avisou_sem_placas = False
+    nomes_placas = carregar_nomes_placas(HOSTNAME)
+
     baseline_ram = calibrar_baseline_ram()
     seq = 0
-    procs_placa = {}   # serie é (Process, cache_filhos)
+    procs_placa = {}   # nome é (Process, cache_filhos)
     seq_placa = {}
     ciclos = 0
     print(f"Bancada detectada (PID {simulador.pid})")
@@ -401,21 +504,25 @@ def rodar_modo_real(simulador_inicial=None):
             ts = datetime.now(timezone.utc).isoformat()
             cwd = simulador.cwd()
             gravou = False
-            for placa in carregar_placas(metadados):
-                serie = placa["serie"]
+            placas = obter_placas_real(metadados, simulador, nomes_placas)
+            if not placas and not avisou_sem_placas:
+                print("Nenhuma placa definida (meta da bancada sem 'placas' e PLACAS_REAL vazio); nada será gravado.")
+                avisou_sem_placas = True
+            for placa in placas:
+                nome = placa["placa_nome"]
                 try:
-                    if serie not in procs_placa:
+                    if nome not in procs_placa:
                         proc, cache = psutil.Process(placa["pid"]), {}
                         medir_cpu_e_tarefas(proc, cache)  # aquece contador; sem linha neste ciclo
-                        procs_placa[serie] = (proc, cache)
+                        procs_placa[nome] = (proc, cache)
                         continue
-                    proc, cache = procs_placa[serie]
+                    proc, cache = procs_placa[nome]
                     amostra = amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram)
                 except psutil.Error:
-                    procs_placa.pop(serie, None)  # filho sumiu; não sintetiza linha
+                    procs_placa.pop(nome, None)  # processo sumiu; não sintetiza linha
                     continue
-                seq_placa[serie] = seq_placa.get(serie, 0) + 1
-                amostra["seq"] = seq_placa[serie]
+                seq_placa[nome] = seq_placa.get(nome, 0) + 1
+                amostra["seq"] = seq_placa[nome]
                 salvar_localmente(amostra)
                 gravou = True
             if gravou:
@@ -425,7 +532,7 @@ def rodar_modo_real(simulador_inicial=None):
                                       sessao_id=SESSAO_EXECUCAO, modo="real", estado_coleta="EM_ANDAMENTO")
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             break
-    if ciclos:   # era `if seq:`
+    if ciclos:
         enviado_final = enviar_lote_nuvem(s3_client, CAMINHO_CSV, hostname=HOSTNAME,
                                           sessao_id=SESSAO_EXECUCAO, modo="real", estado_coleta="CONCLUIDA")
         if not enviado_final:
@@ -483,57 +590,86 @@ def rodar_modo_semana(data_inicio, enviar_s3):
     agenda_de_voos = criar_agenda_simples(data_inicio)
     primeiro_instante = datetime.combine(data_inicio, hora(), tzinfo=fuso)
     sessao_origem = f"SEMANA-{data_inicio.isoformat()}"
+    placas = carregar_placas_do_env("PLACAS_SEMANA")
+
+    if not placas:
+        raise RuntimeError("Defina PLACAS_SEMANA no .env (ex.: P01:CPU,RAM,DISCO;P02:RAM).")
     linhas_do_csv = []
-    ruido_cpu = 0.0
-    ruido_ram = 0.0
-    io_escrita_acum = 0
-    io_leitura_acum = 0
-    # Sete dias com amostragem a cada cinco minutos: 7 * 24 * 12 = 2016 amostras.
+    estado = {}
+
+    nomes_placas = carregar_nomes_placas(HOSTNAME_SEMANA)
+    if not nomes_placas:
+        raise RuntimeError("Sem placas: cadastre no banco (hostname igual a HOSTNAME_SEMANA) ou defina PLACAS no .env.")
+    
+    for placa in placas:
+        estado[placa["placa_nome"]] = {"ruido_cpu": 0.0, "ruido_ram": 0.0, "io_escrita": 0, "io_leitura": 0}
+
+    # Sete dias com amostragem a cada cinco minutos: 7 * 24 * 12 = 2016 amostras por placa.
     for amostra in range(2016):
         instante_atual = primeiro_instante + timedelta(minutes=5 * amostra)
         base_cpu, aviao_em_operacao = estado_simulado_voo(instante_atual, agenda_de_voos)
         fase = fase_semana(instante_atual, agenda_de_voos)
-        ruido_cpu = (0.55 * ruido_cpu) + rng.gauss(0, 2)
-        cpu_final = round(max(0, min(100, base_cpu + ruido_cpu)), 1)
-        ruido_ram = (0.8 * ruido_ram) + rng.gauss(0, 0.4)
         ram_base_pct = 48 + (6 if aviao_em_operacao else 0)
-        ram_final_pct = max(0, min(100, ram_base_pct + ruido_ram))
         flash_final_pct = 52 + (0.20 * amostra / 288)
-        io_escrita_acum += rng.randint(15000, 60000)
-        io_leitura_acum += rng.randint(5000, 20000)
-        cpu_pct_host = cpu_final
-        pacote = {
-            "timestamp_utc": instante_atual.astimezone(timezone.utc).isoformat(),
-            "seq": amostra + 1,
-            "hostname": "GERADOR_SINTETICO",
-            "origem": "SIMULADA_GERADOR",
-            # Não é uptime de processo no modo semanal.
-            "uptime_proc_s": None,
-            "fator_tempo": 1.0,
-            "cpu_percent": cpu_final,
-            "cpu_nucleos": 1,
-            "qtd_tarefas": 18 + (4 if aviao_em_operacao else 0) + rng.randint(0, 3),
-            "ram_usada_bytes": int((ram_final_pct / 100) * RAM_TOTAL_REFERENCIA_BYTES),
-            "ram_baseline_bytes": 0,
-            "ram_total_bytes": RAM_TOTAL_REFERENCIA_BYTES,
-            "ram_disponivel_bytes": int((1 - ram_final_pct / 100) * RAM_TOTAL_REFERENCIA_BYTES),
-            "flash_usada_bytes": int((flash_final_pct / 100) * FMC_FLASH_TOTAL_BYTES),
-            "flash_total_bytes": FMC_FLASH_TOTAL_BYTES,
-            "modo_execucao": "semana",
-            "intervalo_coleta_s": 300,
-            "sessao_origem": sessao_origem,
-            "fase": fase,
-            "cpu_pct_host": cpu_pct_host,
-            "cpu_semantica": "percentual_host_sintetico",
-            "ram_baseline_fonte": "SEM_SUBTRACAO",
-            "ram_medicao_tipo": "SINTETICA_PERCENTUAL_RAM_HOST",
-            "io_leitura_contador_acum": io_leitura_acum,
-            "io_escrita_contador_acum": io_escrita_acum,
-            "io_leitura_unidade": "bytes",
-            "io_escrita_unidade": "bytes",
-        }
+        qtd_tarefas = 18 + (4 if aviao_em_operacao else 0) + rng.randint(0, 3)
 
-        linhas_do_csv.append(pacote)
+        for placa in placas:
+            nome = placa["placa_nome"]
+            comp = placa["componentes"]
+            est = estado[nome]
+
+            # Vazio por padrão: a placa só preenche o que ela mede.
+            pacote = dict.fromkeys(COLUNAS)
+            pacote.update({
+                "timestamp_utc": instante_atual.astimezone(timezone.utc).isoformat(),
+                "seq": amostra + 1,
+                "hostname": HOSTNAME_SEMANA,
+                "placa_nome": nome,
+                "origem": "SIMULADA_GERADOR",
+                "uptime_proc_s": None,
+                "fator_tempo": 1.0,
+                "qtd_tarefas": qtd_tarefas,
+                "modo_execucao": "semana",
+                "intervalo_coleta_s": 300,
+                "sessao_origem": sessao_origem,
+                "fase": fase,
+            })
+
+            if "CPU" in comp:
+                est["ruido_cpu"] = (0.55 * est["ruido_cpu"]) + rng.gauss(0, 2)
+                cpu_final = round(max(0, min(100, base_cpu + est["ruido_cpu"])), 1)
+                pacote.update({
+                    "cpu_percent": cpu_final,
+                    "cpu_nucleos": 1,
+                    "cpu_pct_host": cpu_final,
+                    "cpu_semantica": "percentual_host_sintetico",
+                })
+
+            if "RAM" in comp:
+                est["ruido_ram"] = (0.8 * est["ruido_ram"]) + rng.gauss(0, 0.4)
+                ram_final_pct = max(0, min(100, ram_base_pct + est["ruido_ram"]))
+                pacote.update({
+                    "ram_usada_bytes": int((ram_final_pct / 100) * RAM_TOTAL_REFERENCIA_BYTES),
+                    "ram_baseline_bytes": 0,
+                    "ram_total_bytes": RAM_TOTAL_REFERENCIA_BYTES,
+                    "ram_disponivel_bytes": int((1 - ram_final_pct / 100) * RAM_TOTAL_REFERENCIA_BYTES),
+                    "ram_baseline_fonte": "SEM_SUBTRACAO",
+                    "ram_medicao_tipo": "SINTETICA_PERCENTUAL_RAM_HOST",
+                })
+
+            if "DISCO" in comp:
+                est["io_escrita"] += rng.randint(15000, 60000)
+                est["io_leitura"] += rng.randint(5000, 20000)
+                pacote.update({
+                    "flash_usada_bytes": int((flash_final_pct / 100) * FMC_FLASH_TOTAL_BYTES),
+                    "flash_total_bytes": FMC_FLASH_TOTAL_BYTES,
+                    "io_leitura_contador_acum": est["io_leitura"],
+                    "io_escrita_contador_acum": est["io_escrita"],
+                    "io_leitura_unidade": "bytes",
+                    "io_escrita_unidade": "bytes",
+                })
+
+            linhas_do_csv.append(pacote)
     # Toda a semana cabe em um Bronze único; cada linha representa uma amostra de 5 minutos.
     sessao_semana = f"SEMANA-{data_inicio.isoformat()}-{INICIO_EXECUCAO}"
     caminho_semana = os.getenv("CAMINHO_SEMANA", f"bronze_semana_{INICIO_EXECUCAO}.csv")
@@ -541,7 +677,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
         caminho_semana, sep=";", index=False, encoding="utf-8"
     )
     registrar_bronze_ativo(
-        caminho_semana, "semana", data_inicio, hostname="GERADOR_SINTETICO",
+        caminho_semana, "semana", data_inicio, hostname="HOSTNAME_SEMANA",
         sessao_id=sessao_semana, estado_coleta="EM_ANDAMENTO",
     )
     print(f"Arquivo {caminho_semana} gerado com {len(linhas_do_csv)} amostras.")
@@ -551,7 +687,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
         enviado = enviar_lote_nuvem(
             s3_client=s3_client,
             caminho_csv=caminho_semana,
-            hostname="GERADOR_SINTETICO",
+            hostname="HOSTNAME_SEMANA",
             nome_arquivo=nome_arquivo,
             sessao_id=sessao_semana,
             modo="semana",
