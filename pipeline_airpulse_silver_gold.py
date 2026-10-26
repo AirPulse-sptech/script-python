@@ -468,10 +468,23 @@ def _vincular_cadastro(df, cadastro, componentes):
                 "placa_componentes": ",".join(sorted(tipos)),
             })
 
-        ref_placas = pd.DataFrame(
-            linhas_placas,
-            columns=["_chave_host", "_chave_placa", "placa_id", "placa_componentes"],
+    
+        ref_placas = (
+            comp.groupby(["_chave_host", "_chave_placa"], sort=False)
+            .agg(placa_id=("placa_id", "first"),
+                 placa_componentes=("tipo", lambda t: ",".join(sorted({str(x).upper().replace("FLASH", "DISCO") for x in t}))))
+            .reset_index()
         )
+
+        # Sem placa_nome: linka só se o hostname tiver exatamente 1 placa ativa.
+        contagem = ref_placas.groupby("_chave_host")["_chave_placa"].transform("nunique")
+        mapa_unica = ref_placas.loc[contagem == 1].set_index("_chave_host")["_chave_placa"]
+        sem_placa = df["_chave_placa"].isna()
+        df.loc[sem_placa, "_chave_placa"] = df.loc[sem_placa, "_chave_host"].map(mapa_unica)
+
+        df = df.merge(ref_placas, on=["_chave_host", "_chave_placa"], how="left", validate="many_to_one")
+
+
         df = df.merge(
             ref_placas,
             on=["_chave_host", "_chave_placa"],
@@ -536,19 +549,6 @@ def anexar_cadastro(df_gold: pd.DataFrame, df_silver: pd.DataFrame):
     primeiras = ["hostname", *COLUNAS_CADASTRO]
 
     return saida[primeiras + [c for c in saida.columns if c not in primeiras]]
-
-def anexar_placa(df_gold: pd.DataFrame, df_silver: pd.DataFrame):
-    # Coloca placa_id e os componentes da placa nas tabelas Gold, por (hostname, placa_nome).
-    if df_gold.empty:
-        return df_gold
-    novas = []
-    for coluna in ("placa_id", "placa_componentes"):
-        if coluna not in df_gold.columns:
-            novas.append(coluna)
-    if not novas:
-        return df_gold
-    ref = df_silver[CHAVES_BASE + novas].drop_duplicates(CHAVES_BASE)
-    return df_gold.merge(ref, on=CHAVES_BASE, how="left")
 
 def vincular_componente_alertas(df_alertas: pd.DataFrame, componentes): 
     # Liga cada alerta ao componente e à placa monitorados (cpu->CPU, ram->RAM, flash->DISCO).
@@ -692,44 +692,30 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
         df[coluna_contador] = pd.to_numeric(df[coluna_contador], errors="coerce")
         df[coluna_unidade] = df[coluna_unidade].fillna("desconhecida").astype(str).str.lower()
         df.loc[~df[coluna_unidade].isin(["bytes", "chars"]), coluna_unidade] = "desconhecida"
+
     # A CPU normalizada vem diretamente do agente.
     # Não divide de novo por núcleos, porque isso reduziria a CPU duas vezes.
     # Também não tenta adivinhar a semântica pelo nome da origem.
     candidato_cpu = pd.to_numeric(df["cpu_pct_host"], errors="coerce")
-    df["q_cpu_semantica_indeterminada"] = candidato_cpu.isna()
-    df["q_cpu_acima_100"] = candidato_cpu > 100
-    df["q_cpu_negativa"] = candidato_cpu < 0
-    df["q_cpu_valor_invalido"] = df["q_cpu_acima_100"] | df["q_cpu_negativa"]
     df["cpu_pct"] = candidato_cpu.where(candidato_cpu.between(0, 100, inclusive="both"))
+
+
     # RAM: baseline só é aplicada quando a origem declara calibração do processo monitorado.
     ram_usada_valida = df["ram_usada_bytes"].where(df["ram_usada_bytes"] >= 0)
-    baseline_valida = (
-        df["ram_baseline_fonte"].fillna("").astype(str).str.upper()
-        == "CALIBRADA_NO_PROCESSO_MONITORADO"
-    ) & df["ram_baseline_bytes"].notna() & (df["ram_baseline_bytes"] >= 0)
     baseline_aplicada = df["ram_baseline_bytes"].where(baseline_valida, 0.0)
     df["ram_logica_bytes"] = (ram_usada_valida - baseline_aplicada).clip(lower=0)
-    df["q_ram_baseline_ignorada"] = (
-        df["ram_baseline_bytes"].fillna(0).gt(0) & ~baseline_valida
-    )
     # Total igual a zero não pode servir como divisor para calcular percentuais.
     ram_total_valido = df["ram_total_bytes"].where(df["ram_total_bytes"] > 0)
-    # A disponibilidade de RAM precisa vir do agente. Não a calculamos por diferença,
-    # pois RAM usada pode representar RSS do processo e RAM total pode ser a do host.
-    df["q_ram_disponivel_invalida"] = (
+    ram_disp_invalida = (
         df["ram_disponivel_bytes"].notna()
         & ((df["ram_disponivel_bytes"] < 0)
-           | (ram_total_valido.notna() & (df["ram_disponivel_bytes"] > ram_total_valido)))
+        | (ram_total_valido.notna() & (df["ram_disponivel_bytes"] > ram_total_valido)))
     )
-    df["ram_disponivel_bytes"] = df["ram_disponivel_bytes"].where(~df["q_ram_disponivel_invalida"])
-    # Divide a RAM disponível pela capacidade declarada para obter a percentagem livre.
+    df["ram_disponivel_bytes"] = df["ram_disponivel_bytes"].where(~ram_disp_invalida)
     df["ram_disponivel_pct"] = df["ram_disponivel_bytes"] / ram_total_valido * 100
-    # A Flash também precisa ter capacidade positiva antes de calcular o percentual ocupado.
     flash_total_valido = df["flash_total_bytes"].where(df["flash_total_bytes"] > 0)
     df["ram_pct"] = df["ram_logica_bytes"] / ram_total_valido * 100
     df["flash_pct"] = df["flash_usada_bytes"].where(df["flash_usada_bytes"] >= 0) / flash_total_valido * 100
-    df["q_ram_acima_100"] = df["ram_pct"] > 100
-    df["q_flash_acima_100"] = df["flash_pct"] > 100
     # O agente novo grava a fase observada nos metadados da bancada.
     # Se ela não vier, não tentamos deduzi-la pelo uptime: marcamos como desconhecida.
     df["fase"] = df["fase"].fillna("NAO_DETERMINADA").astype(str).str.strip()
@@ -803,7 +789,6 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
     df["dt_s"] = grupos_sessao["ts"].diff().dt.total_seconds()
     df["t_sessao_s"] = (df["ts"] - grupos_sessao["ts"].transform("min")).dt.total_seconds()
     intervalo_seguro = df["intervalo_esperado_s"].where(df["intervalo_esperado_s"] > 0)
-    df["q_intervalo_indeterminado"] = intervalo_seguro.isna()
     q_lacuna = df["dt_s"].gt(intervalo_seguro * 1.5).astype("boolean")
     # A primeira amostra não tem intervalo anterior; com cadência conhecida, isso não é lacuna.
     q_lacuna.loc[df["dt_s"].isna() & intervalo_seguro.notna()] = False
@@ -816,7 +801,6 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
         np.isfinite(ausentes_estimados) & (ausentes_estimados > 0), 0
     ).clip(lower=0)
     df.loc[intervalo_seguro.isna(), "q_amostras_ausentes"] = np.nan
-    df["q_dt_invalido"] = df["dt_s"].isna() | (df["dt_s"] <= 0)
     # Taxas diferenciais de I/O, sem converter caracteres em bytes e sem transformar reset em zero.
     for tipo in ("leitura", "escrita"):
         # diff obtém quanto o contador cresceu desde a amostra anterior.
@@ -824,15 +808,11 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
         coluna = f"io_{tipo}_contador_acum"
         unidade = f"io_{tipo}_unidade"
         delta = grupos_sessao[coluna].diff()
-        unidade_anterior = grupos_sessao[unidade].shift()
-        unidade_estavel = df[unidade].eq(unidade_anterior) & df[unidade].isin(["bytes", "chars"])
-        reiniciou = delta < 0
-        dt_valido = df["dt_s"] > 0
-        delta_valido = delta.where(unidade_estavel & ~reiniciou & dt_valido)
-        df[f"q_io_{tipo}_contador_reiniciado"] = reiniciou.fillna(False)
+        unidade_estavel = df[unidade].eq(grupos_sessao[unidade].shift()) & df[unidade].isin(["bytes", "chars"])
+        delta_valido = delta.where(unidade_estavel & (delta >= 0) & (df["dt_s"] > 0))
         df[f"io_{tipo}_kbps"] = (delta_valido / df["dt_s"] / BYTES_POR_KB).where(df[unidade].eq("bytes"))
         df[f"io_{tipo}_chars_s"] = (delta_valido / df["dt_s"]).where(df[unidade].eq("chars"))
-    # Coluna auxiliar interna não precisa ir à Silver persistida.
+        
     df = df.drop(columns=["_reinicio", "_chave_host"])
     df.attrs["duplicatas_descartadas"] = quantidade_duplicadas
     df = df.drop(columns=["_chave_placa"])
@@ -843,32 +823,6 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro=None, componentes=
 # BLOCO 6: MOTOR DE ALERTAS
 
 # Reconstrói alertas ativos e gera eventos auditáveis com persistência e histerese.
-
-def _alertas_ativos(df_alertas: pd.DataFrame):
-    # Repassa os eventos em ordem temporal e devolve só os alertas ainda abertos.
-    ativos = {}
-    if df_alertas.empty:
-        return ativos
-    eventos = df_alertas.sort_values("ts_evento", kind="mergesort")
-    for _, evento in eventos.iterrows():
-        chave = (str(evento["hostname"]), str(evento["placa_nome"]), str(evento["alerta_id"]))
-        tipo = evento["tipo_evento"]
-        if tipo == "ABERTURA":
-            ativos[chave] = evento["nivel"]
-        elif tipo in ("ESCALONAMENTO", "REBAIXAMENTO") and chave in ativos:
-            ativos[chave] = evento["nivel"]
-        elif tipo == "ENCERRAMENTO":
-            ativos.pop(chave, None)
-    return ativos
-
-def _estado_saude(criticos: int, atencao: int, health):
-    if criticos:
-        return "CRITICO"
-    if atencao:
-        return "ATENCAO"
-    if pd.isna(health):
-        return "DADOS_INSUFICIENTES"
-    return "SEM_ALERTAS_ATIVOS"
 
 def _registro_evento_alerta(identificadores, metrica, tipo_evento, nivel, valor,
                             limiar_violado, ts_abertura, linha_evento, fase_abertura,
@@ -1212,6 +1166,40 @@ def calcular_kpis_sessao(grupo: pd.DataFrame, identificadores: dict):
     kpis["health_pct_amostras_criticas"] = pct_critico
     return kpis
 
+
+
+
+_ORDEM_SEVERIDADE = {"CRITICO": 2, "ATENCAO": 1, "NORMAL": 0}
+
+def calcular_serie_diaria(df_silver: pd.DataFrame):
+    # Resume por dia a PIOR severidade entre CPU/RAM/Flash, para o mapa de calor.
+    # Métrica não configurada/indeterminada não entra na conta (nunca inventa severidade).
+    colunas_nivel = [f"nivel_{m}" for m in METRICAS_ALERTAVEIS if f"nivel_{m}" in df_silver.columns]
+    severidade_amostra = pd.Series(np.nan, index=df_silver.index)
+    for coluna in colunas_nivel:
+        severidade_amostra = np.fmax(severidade_amostra, df_silver[coluna].map(_ORDEM_SEVERIDADE))
+    df = df_silver.assign(_severidade_amostra=severidade_amostra)
+
+    resultado = (
+        df.groupby(CHAVES_BASE + [pd.Grouper(key="ts", freq="1D")], dropna=False, observed=True)
+        .agg(
+            amostras=("ts", "count"),
+            cpu_media=("cpu_pct", "mean"),
+            ram_media=("ram_pct", "mean"),
+            flash_media=("flash_pct", "mean"),
+            severidade_max=("_severidade_amostra", "max"),
+            lacunas=("q_lacuna", lambda v: v.sum(min_count=1)),
+        )
+        .reset_index()
+    )
+    for coluna in ("cpu_media", "ram_media", "flash_media"):
+        resultado[coluna] = resultado[coluna].round(2)
+
+    mapa_nome = {2: "CRITICO", 1: "ATENCAO", 0: "NORMAL"}
+    resultado["nivel_dia"] = resultado["severidade_max"].map(mapa_nome)
+    return resultado.drop(columns=["severidade_max"])
+
+
 def calcular_kpis_por_fase(df_silver: pd.DataFrame):
     # Resume métricas por fase; fases não modeladas não recebem baseline inventado.
     chaves = CHAVES_AGRUPAMENTO + ["fase"]
@@ -1268,179 +1256,11 @@ def processar_camada_gold(df_silver: pd.DataFrame, componentes=None):
 
     for coluna in ("cpu_media", "ram_media", "flash_media"):
         df_serie_1min[coluna] = df_serie_1min[coluna].round(3)
-    df_kpis_fase = calcular_kpis_por_fase(df_silver)
-    df_alertas = vincular_componente_alertas(gerar_alertas(df_silver), componentes)
+        df_kpis_fase = calcular_kpis_por_fase(df_silver)
+        df_alertas = vincular_componente_alertas(gerar_alertas(df_silver), componentes)
+        df_serie_diaria = calcular_serie_diaria(df_silver) 
 
-    return df_kpis_sessao, df_serie_1min, df_kpis_fase, df_alertas
-
-def criar_resumo_placa(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_alertas: pd.DataFrame):
-    # Um estado por placa (hostname + placa_nome): último KPI de sessão + alertas abertos.
-    colunas_saida = [
-        *CHAVES_BASE, "placa_id", "placa_componentes", "ultima_amostra_utc", "ultima_fase",
-        "ultima_sessao", "amostras_sessao", "completude_pct", "health_score",
-        "health_score_status", "alertas_abertos", "alertas_criticos_abertos",
-        "alertas_atencao_abertos", "estado_saude",
-    ]
-    ativos = _alertas_ativos(df_alertas)
-    linhas = []
-
-    for _, grupo in df_silver.groupby(CHAVES_BASE, dropna=False, sort=False):
-        ultima = grupo.sort_values("ts").iloc[-1]
-        host = str(ultima["hostname"])
-        placa = str(ultima["placa_nome"])
-
-        criticos = 0
-        atencao = 0
-        for (host_alerta, placa_alerta, _), nivel in ativos.items():
-            if host_alerta == host and placa_alerta == placa:
-                if nivel == "CRITICO":
-                    criticos += 1
-                elif nivel == "ATENCAO":
-                    atencao += 1
-
-        kpi = None
-        if not df_kpis_sessao.empty:
-            do_host = df_kpis_sessao["hostname"].astype(str) == host
-            da_placa = df_kpis_sessao["placa_nome"].astype(str) == placa
-            candidatos = df_kpis_sessao[do_host & da_placa]
-            if not candidatos.empty:
-                kpi = candidatos.sort_values("fim").iloc[-1]
-
-        health = np.nan
-        health_status = "DADOS_INSUFICIENTES"
-        amostras = np.nan
-        completude = np.nan
-        if kpi is not None:
-            health = kpi["health_score"]
-            health_status = kpi["health_score_status"]
-            amostras = kpi["amostras"]
-            completude = kpi["completude_pct"]
-
-        linhas.append({
-            "hostname": ultima["hostname"],
-            "placa_nome": ultima["placa_nome"],
-            "placa_id": ultima.get("placa_id", np.nan),
-            "placa_componentes": ultima.get("placa_componentes", np.nan),
-            "ultima_amostra_utc": ultima["ts"].isoformat(),
-            "ultima_fase": str(ultima.get("fase", "NAO_DETERMINADA")),
-            "ultima_sessao": ultima.get("sessao", np.nan),
-            "amostras_sessao": amostras,
-            "completude_pct": completude,
-            "health_score": health,
-            "health_score_status": health_status,
-            "alertas_abertos": criticos + atencao,
-            "alertas_criticos_abertos": criticos,
-            "alertas_atencao_abertos": atencao,
-            "estado_saude": _estado_saude(criticos, atencao, health),
-        })
-
-    return pd.DataFrame(linhas, columns=colunas_saida)
-
-def anexar_placa(df_gold: pd.DataFrame, df_silver: pd.DataFrame) -> pd.DataFrame:
-    # Coloca placa_id e os componentes da placa nas tabelas Gold, por (hostname, placa_nome).
-    if df_gold.empty:
-        return df_gold
-    novas = []
-    for coluna in ("placa_id", "placa_componentes"):
-        if coluna not in df_gold.columns:
-            novas.append(coluna)
-    if not novas:
-        return df_gold
-    ref = df_silver[CHAVES_BASE + novas].drop_duplicates(CHAVES_BASE)
-    return df_gold.merge(ref, on=CHAVES_BASE, how="left")
-
-
-def _alertas_ativos(df_alertas: pd.DataFrame) -> dict:
-    # Repassa os eventos em ordem temporal e devolve só os alertas ainda abertos.
-    ativos = {}
-    if df_alertas.empty:
-        return ativos
-    eventos = df_alertas.sort_values("ts_evento", kind="mergesort")
-    for _, evento in eventos.iterrows():
-        chave = (str(evento["hostname"]), str(evento["placa_nome"]), str(evento["alerta_id"]))
-        tipo = evento["tipo_evento"]
-        if tipo == "ABERTURA":
-            ativos[chave] = evento["nivel"]
-        elif tipo in ("ESCALONAMENTO", "REBAIXAMENTO") and chave in ativos:
-            ativos[chave] = evento["nivel"]
-        elif tipo == "ENCERRAMENTO":
-            ativos.pop(chave, None)
-    return ativos
-
-
-def _estado_saude(criticos: int, atencao: int, health) -> str:
-    if criticos:
-        return "CRITICO"
-    if atencao:
-        return "ATENCAO"
-    if pd.isna(health):
-        return "DADOS_INSUFICIENTES"
-    return "SEM_ALERTAS_ATIVOS"
-
-
-def criar_resumo_placa(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_alertas: pd.DataFrame) -> pd.DataFrame:
-    # Um estado por placa (hostname + placa_nome): último KPI de sessão + alertas abertos.
-    colunas_saida = [
-        *CHAVES_BASE, "placa_id", "placa_componentes", "ultima_amostra_utc", "ultima_fase",
-        "ultima_sessao", "amostras_sessao", "completude_pct", "health_score",
-        "health_score_status", "alertas_abertos", "alertas_criticos_abertos",
-        "alertas_atencao_abertos", "estado_saude",
-    ]
-    ativos = _alertas_ativos(df_alertas)
-    linhas = []
-
-    for _, grupo in df_silver.groupby(CHAVES_BASE, dropna=False, sort=False):
-        ultima = grupo.sort_values("ts").iloc[-1]
-        host = str(ultima["hostname"])
-        placa = str(ultima["placa_nome"])
-
-        criticos = 0
-        atencao = 0
-        for (host_alerta, placa_alerta, _), nivel in ativos.items():
-            if host_alerta == host and placa_alerta == placa:
-                if nivel == "CRITICO":
-                    criticos += 1
-                elif nivel == "ATENCAO":
-                    atencao += 1
-
-        kpi = None
-        if not df_kpis_sessao.empty:
-            do_host = df_kpis_sessao["hostname"].astype(str) == host
-            da_placa = df_kpis_sessao["placa_nome"].astype(str) == placa
-            candidatos = df_kpis_sessao[do_host & da_placa]
-            if not candidatos.empty:
-                kpi = candidatos.sort_values("fim").iloc[-1]
-
-        health = np.nan
-        health_status = "DADOS_INSUFICIENTES"
-        amostras = np.nan
-        completude = np.nan
-        if kpi is not None:
-            health = kpi["health_score"]
-            health_status = kpi["health_score_status"]
-            amostras = kpi["amostras"]
-            completude = kpi["completude_pct"]
-
-        linhas.append({
-            "hostname": ultima["hostname"],
-            "placa_nome": ultima["placa_nome"],
-            "placa_id": ultima.get("placa_id", np.nan),
-            "placa_componentes": ultima.get("placa_componentes", np.nan),
-            "ultima_amostra_utc": ultima["ts"].isoformat(),
-            "ultima_fase": str(ultima.get("fase", "NAO_DETERMINADA")),
-            "ultima_sessao": ultima.get("sessao", np.nan),
-            "amostras_sessao": amostras,
-            "completude_pct": completude,
-            "health_score": health,
-            "health_score_status": health_status,
-            "alertas_abertos": criticos + atencao,
-            "alertas_criticos_abertos": criticos,
-            "alertas_atencao_abertos": atencao,
-            "estado_saude": _estado_saude(criticos, atencao, health),
-        })
-
-    return pd.DataFrame(linhas, columns=colunas_saida)
-
+    return df_kpis_sessao, df_serie_1min, df_kpis_fase, df_alertas, df_serie_diaria  # <-- novo retorno
 
 def criar_resumo_fmc(df_silver: pd.DataFrame, df_resumo_placa: pd.DataFrame) -> pd.DataFrame:
     # FMC = soma dos alertas das placas; saúde = pior placa (decisão a confirmar).
@@ -1487,51 +1307,124 @@ def criar_resumo_fmc(df_silver: pd.DataFrame, df_resumo_placa: pd.DataFrame) -> 
         })
 
     return pd.DataFrame(linhas, columns=colunas_saida)
-    # FMC = soma dos alertas das placas; saúde = pior placa (decisão a confirmar).
+
+def criar_resumo_placa(df_silver: pd.DataFrame, df_kpis_sessao: pd.DataFrame, df_alertas: pd.DataFrame):
+    # Um estado por placa (hostname + placa_nome): último KPI de sessão + alertas abertos.
     colunas_saida = [
-        *CHAVES_FMC, "ultima_amostra_utc", "placas_monitoradas", "placas_com_alerta",
-        "alertas_abertos", "alertas_criticos_abertos", "alertas_atencao_abertos",
-        "completude_pct", "health_score", "health_score_status", "pior_placa", "estado_saude",
+    *CHAVES_BASE, "placa_id", "placa_componentes", "ultima_amostra_utc", "ultima_fase",
+    "ultima_sessao", "amostras_sessao", "completude_pct", "health_score",
+    "health_score_status", "alertas_abertos", "alertas_criticos_abertos",
+    "alertas_atencao_abertos", "estado_saude",
+    "cpu_pico", "ram_pico", "flash_max_pct", "reinicios_detectados",
     ]
+    ativos = _alertas_ativos(df_alertas)
     linhas = []
 
-    for host, placas in df_resumo_placa.groupby("hostname", sort=False):
+    for _, grupo in df_silver.groupby(CHAVES_BASE, dropna=False, sort=False):
+        ultima = grupo.sort_values("ts").iloc[-1]
+        host = str(ultima["hostname"])
+        placa = str(ultima["placa_nome"])
+
         criticos = 0
         atencao = 0
-        com_alerta = 0
-        pior_health = np.nan
-        pior_placa = None
+        for (host_alerta, placa_alerta, _), nivel in ativos.items():
+            if host_alerta == host and placa_alerta == placa:
+                if nivel == "CRITICO":
+                    criticos += 1
+                elif nivel == "ATENCAO":
+                    atencao += 1
+
+        kpi = None
+        if not df_kpis_sessao.empty:
+            do_host = df_kpis_sessao["hostname"].astype(str) == host
+            da_placa = df_kpis_sessao["placa_nome"].astype(str) == placa
+            candidatos = df_kpis_sessao[do_host & da_placa]
+            if not candidatos.empty:
+                kpi = candidatos.sort_values("fim").iloc[-1]
+
+        health = np.nan
+        health_status = "DADOS_INSUFICIENTES"
+        amostras = np.nan
         completude = np.nan
+        cpu_pico = np.nan          # <-- novo (P-05)
+        ram_pico = np.nan          # <-- novo (P-05)
+        flash_max_pct = np.nan     # <-- novo (P-05)
+        if kpi is not None:
+            health = kpi["health_score"]
+            health_status = kpi["health_score_status"]
+            amostras = kpi["amostras"]
+            completude = kpi["completude_pct"]
+            cpu_pico = kpi.get("cpu_pico", np.nan)          # <-- novo
+            ram_pico = kpi.get("ram_pico", np.nan)          # <-- novo
+            flash_max_pct = kpi.get("flash_max_pct", np.nan)  # <-- novo
 
-        for _, placa in placas.iterrows():
-            criticos += int(placa["alertas_criticos_abertos"])
-            atencao += int(placa["alertas_atencao_abertos"])
-            if placa["alertas_abertos"] > 0:
-                com_alerta += 1
-            if pd.notna(placa["health_score"]) and (pd.isna(pior_health) or placa["health_score"] < pior_health):
-                pior_health = placa["health_score"]
-                pior_placa = placa["placa_nome"]
-            if pd.notna(placa["completude_pct"]) and (pd.isna(completude) or placa["completude_pct"] < completude):
-                completude = placa["completude_pct"]
+        sessao_final = ultima.get("sessao", np.nan)   # <-- novo (P-02)
+        reinicios = int(sessao_final) - 1 if pd.notna(sessao_final) else np.nan  # <-- novo
 
-        ultima_ts = df_silver.loc[df_silver["hostname"] == host, "ts"].max()
         linhas.append({
-            "hostname": host,
-            "ultima_amostra_utc": ultima_ts.isoformat(),
-            "placas_monitoradas": len(placas),
-            "placas_com_alerta": com_alerta,
+            "hostname": ultima["hostname"],
+            "placa_nome": ultima["placa_nome"],
+            "placa_id": ultima.get("placa_id", np.nan),
+            "placa_componentes": ultima.get("placa_componentes", np.nan),
+            "ultima_amostra_utc": ultima["ts"].isoformat(),
+            "ultima_fase": str(ultima.get("fase", "NAO_DETERMINADA")),
+            "ultima_sessao": sessao_final,
+            "amostras_sessao": amostras,
+            "completude_pct": completude,
+            "health_score": health,
+            "health_score_status": health_status,
             "alertas_abertos": criticos + atencao,
             "alertas_criticos_abertos": criticos,
             "alertas_atencao_abertos": atencao,
-            "completude_pct": completude,
-            "health_score": pior_health,
-            "health_score_status": "OK" if pd.notna(pior_health) else "DADOS_INSUFICIENTES",
-            "pior_placa": pior_placa,
-            "estado_saude": _estado_saude(criticos, atencao, pior_health),
+            "estado_saude": _estado_saude(criticos, atencao, health),
+            "cpu_pico": cpu_pico,                 
+            "ram_pico": ram_pico,                 
+            "flash_max_pct": flash_max_pct,       
+            "reinicios_detectados": reinicios,    
         })
 
     return pd.DataFrame(linhas, columns=colunas_saida)
 
+def anexar_placa(df_gold: pd.DataFrame, df_silver: pd.DataFrame) -> pd.DataFrame:
+    # Coloca placa_id e os componentes da placa nas tabelas Gold, por (hostname, placa_nome).
+    if df_gold.empty:
+        return df_gold
+    novas = []
+    for coluna in ("placa_id", "placa_componentes"):
+        if coluna not in df_gold.columns:
+            novas.append(coluna)
+    if not novas:
+        return df_gold
+    ref = df_silver[CHAVES_BASE + novas].drop_duplicates(CHAVES_BASE)
+    return df_gold.merge(ref, on=CHAVES_BASE, how="left")
+
+
+def _alertas_ativos(df_alertas: pd.DataFrame) -> dict:
+    # Repassa os eventos em ordem temporal e devolve só os alertas ainda abertos.
+    ativos = {}
+    if df_alertas.empty:
+        return ativos
+    eventos = df_alertas.sort_values("ts_evento", kind="mergesort")
+    for _, evento in eventos.iterrows():
+        chave = (str(evento["hostname"]), str(evento["placa_nome"]), str(evento["alerta_id"]))
+        tipo = evento["tipo_evento"]
+        if tipo == "ABERTURA":
+            ativos[chave] = evento["nivel"]
+        elif tipo in ("ESCALONAMENTO", "REBAIXAMENTO") and chave in ativos:
+            ativos[chave] = evento["nivel"]
+        elif tipo == "ENCERRAMENTO":
+            ativos.pop(chave, None)
+    return ativos
+
+
+def _estado_saude(criticos: int, atencao: int, health) -> str:
+    if criticos:
+        return "CRITICO"
+    if atencao:
+        return "ATENCAO"
+    if pd.isna(health):
+        return "DADOS_INSUFICIENTES"
+    return "SEM_ALERTAS_ATIVOS"
 
 #============================================================================================================================================
 # BLOCO 8: PUBLICAÇÃO DOS ARQUIVOS NO S3
@@ -1752,7 +1645,7 @@ if __name__ == "__main__":
         )
 
     print("Processando Gold...")
-    df_sessao, df_serie, df_fase, df_alertas = processar_camada_gold(df_silver, componentes)
+    df_sessao, df_serie, df_fase, df_alertas, df_diaria = processar_camada_gold(df_silver, componentes) 
     df_resumo_placa = criar_resumo_placa(df_silver, df_sessao, df_alertas)
     df_resumo_fmc = criar_resumo_fmc(df_silver, df_resumo_placa)
     
@@ -1786,6 +1679,7 @@ if __name__ == "__main__":
         gold_por_nome = {
             "gold_kpi_sessao": anexar_cadastro(anexar_placa(df_sessao, df_silver), df_silver),
             "gold_serie_1min": anexar_cadastro(anexar_placa(df_serie, df_silver), df_silver),
+            "gold_serie_diaria": anexar_cadastro(anexar_placa(df_diaria, df_silver), df_silver),  # <-- novo
             "gold_kpi_fase": anexar_cadastro(anexar_placa(df_fase, df_silver), df_silver),
             "gold_alertas": anexar_cadastro(df_alertas, df_silver),
             "gold_resumo_placa": anexar_cadastro(df_resumo_placa, df_silver),
