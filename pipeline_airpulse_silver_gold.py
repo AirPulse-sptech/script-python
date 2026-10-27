@@ -209,7 +209,7 @@ def selecionar_arquivo_bronze():
         if os.path.exists(caminho):
             return caminho
         
-    raise FileNotFoundError("Nenhum Bronze local foi encontrado. Use --origem s3 --hostname HOST ou 5--s3-key CHAVE.")
+    raise FileNotFoundError("Nenhum Bronze local foi encontrado. Use --origem s3 --hostname HOST ou --s3-key CHAVE.")
 
 def _interpretar_referencia_s3(referencia, bucket_padrao):
     if not referencia:
@@ -298,7 +298,7 @@ def carregar_bronze_s3(*, bucket=None, s3_key=None, hostname=None, manifest_key=
         raise ValueError(f"O objeto s3://{bucket}/{chave_objeto} não contém amostras.")
     if metadata.get("estado_coleta") == "EM_ANDAMENTO":
         print("Aviso: o manifesto indica que a coleta ainda está EM_ANDAMENTO; o Bronze pode ser parcial.")
-    return df, f"s3://{bucket}/{chave_objeto}", metadata, bucket, chave_objeto
+    return df, f"s3://{bucket}/{chave_objeto}"
 
 
 #===========================================================================================================================================
@@ -306,9 +306,6 @@ def carregar_bronze_s3(*, bucket=None, s3_key=None, hostname=None, manifest_key=
 
 # Carrega o cadastro, normaliza chaves e associa hostname, placa, componentes e limites.
 
-def _chave_hostname(serie: pd.Series): 
-    # Compara hostnames sem diferenciar maiúsculas/minúsculas (Windows costuma devolver em MAIÚSCULAS).
-    return serie.astype(str).str.strip().str.lower()
 
 def _segmento_s3(valor):
     # Troca sequências de caracteres fora de [A-Za-z0-9._-] por "_" e nunca devolve vazio.
@@ -316,7 +313,7 @@ def _segmento_s3(valor):
 
 def _chave_texto(serie: pd.Series):
     # Compara texto sem diferenciar maiúsculas/minúsculas (Windows costuma devolver hostname em MAIÚSCULAS).
-    return serie.astype(str).str.strip().str.lower()   # (renomeia _chave_hostname)
+    return serie.astype(str).str.strip().str.lower() 
 
 def _limites_do_grupo(grupo: pd.DataFrame, metrica: str):
     # Lê os limites do próprio computador gravados na Silver; sem par único e válido, não há limite.
@@ -1301,7 +1298,7 @@ if __name__ == "__main__":
         help="Bucket S3 (ou configure BUCKET_NAME no .env).",
     )
     comandos = terminal.parse_args()
-    comandos = terminal.parse_args()
+
     origem = comandos.origem
 
     # Seleção S3 explícita (ou origem s3) ignora qualquer CSV local antigo.
@@ -1316,7 +1313,7 @@ if __name__ == "__main__":
             usa_s3 = True
     if usa_s3:
         try:
-            df_bronze, local_origem, *_ = carregar_bronze_s3(
+            df_bronze, local_origem = carregar_bronze_s3(
                 bucket=comandos.bucket, s3_key=comandos.s3_key,
                 hostname=comandos.hostname, manifest_key=comandos.manifest_key)
         except Exception as erro:

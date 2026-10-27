@@ -725,7 +725,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
         caminho_semana, sep=";", index=False, encoding="utf-8"
     )
     registrar_bronze_ativo(
-        caminho_semana, "semana", data_inicio, hostname="HOSTNAME_SEMANA",
+        caminho_semana, "semana", data_inicio, hostname=HOSTNAME_SEMANA,
         sessao_id=sessao_semana, estado_coleta="EM_ANDAMENTO",
     )
     print(f"Arquivo {caminho_semana} gerado com {len(linhas_do_csv)} amostras.")
@@ -735,7 +735,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
         enviado = enviar_lote_nuvem(
             s3_client=s3_client,
             caminho_csv=caminho_semana,
-            hostname="HOSTNAME_SEMANA",
+            hostname=HOSTNAME_SEMANA,
             nome_arquivo=nome_arquivo,
             sessao_id=sessao_semana,
             modo="semana",
