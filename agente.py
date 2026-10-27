@@ -2,6 +2,10 @@
 #
 # Os campos observados são registrados no Bronze. As métricas derivadas,
 # validações e avaliações de saúde ficam para as camadas Silver e Gold.
+
+# ============================================================================
+# 1. IMPORTAÇÕES E CONFIGURAÇÕES GERAIS
+
 import json
 import os
 import random
@@ -9,11 +13,16 @@ import re
 import socket
 import time
 from datetime import date, datetime, timedelta, timezone, time as hora
+
 import pandas as pd
 import psutil
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+
+# ============================================================================
+# 2. CONFIGURAÇÕES DE AMBIENTE, SESSÃO E COLETA
 
 # Identidade e nuvem. Em EC2, prefira uma IAM Role em vez de chaves fixas no .env.
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("aws_access_key_id")
@@ -24,9 +33,11 @@ BUCKET_NAME = os.getenv("BUCKET_NAME") or os.getenv("S3_BUCKET_NAME", "mateus-ai
 S3_PREFIXO = os.getenv("S3_PREFIXO_BRONZE", "01-bronze").strip("/")
 S3_PREFIXO_MANIFESTOS = f"{S3_PREFIXO}/manifestos"
 HOSTNAME = socket.gethostname()
+HOSTNAME_SEMANA = os.getenv("HOSTNAME_SEMANA", "GERADOR_SINTETICO")
 INICIO_EXECUCAO = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 SESSAO_EXECUCAO = INICIO_EXECUCAO
 NOME_OBJETO_S3 = f"{HOSTNAME}_{INICIO_EXECUCAO}.csv"
+
 # Cada execução usa um CSV local independente: amostras antigas não entram na sessão nova.
 CAMINHO_CSV = f"bronze_bruto_{NOME_OBJETO_S3}"
 INTERVALO_COLETA_S = max(1, int(os.getenv("INTERVALO_COLETA_S", "2")))
@@ -38,9 +49,15 @@ ARQUIVO_ESTADO_BRONZE = os.getenv("ARQUIVO_ESTADO_BRONZE", "bronze_ativo.json")
 JANELA_DETECCAO_BANCADA_S = max(0.0, float(os.getenv("JANELA_DETECCAO_BANCADA_S", "5")))
 ARQUIVO_FLASH = "fmc_flash_bite.log"
 ARQUIVO_META = "bancada_meta.json"
+COMPONENTES_TODOS = {"CPU", "RAM", "DISCO"}  # Placa sem declaração no meta mede os 3 tipos
+
+
+# ============================================================================
+# 3. ESQUEMA DO BRONZE: COLUNAS REGISTRADAS NO CSV
+
 # Lista as colunas do contrato atual do Bronze.
 # Os contadores canônicos vêm acompanhados da unidade, para não confundir bytes com caracteres.
-# Campos derivados ficam para as camadas seguintes; os aliases repetidos de I/O foram retirados.
+# Campos derivados ficam para as camadas seguintes
 COLUNAS = [
     "timestamp_utc", "seq",
     "hostname", "placa_nome", "origem", "uptime_proc_s", "fator_tempo", "cpu_percent", "cpu_nucleos",
@@ -52,6 +69,9 @@ COLUNAS = [
     "io_leitura_unidade", "io_escrita_unidade",
 ]
 
+
+# ============================================================================
+# 4. CONFIGURAÇÃO E DESCOBERTA DAS PLACAS
 
 def tipos_validos(lista):
     tipos = set()
@@ -78,6 +98,7 @@ def carregar_placas(metadados):
                            "arquivo_flash": item.get("arquivo_flash")})
     return placas
 
+
 def carregar_placas_do_env(variavel):
     # Formato: P01:CPU,RAM,DISCO;P02:RAM;P03:DISCO
     placas = []
@@ -91,72 +112,6 @@ def carregar_placas_do_env(variavel):
             placas.append({"placa_nome": nome, "componentes": componentes})
     return placas
 
-
-def obter_placas_real(metadados, simulador):
-    # Prioridade: placas do meta da bancada. Sem isso, usa PLACAS_REAL e mede o processo da bancada.
-    placas = carregar_placas(metadados)
-    if placas:
-        return placas
-    placas = carregar_placas_do_env("PLACAS_REAL")
-    for placa in placas:
-        placa["pid"] = simulador.pid
-        placa["arquivo_flash"] = ARQUIVO_FLASH
-    return placas
-
-def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram):
-    comp = placa["componentes"]
-    a = dict.fromkeys(COLUNAS)  # vazio por padrão: só preenche o que a placa mede
-    cpu_bruto, tarefas = medir_cpu_e_tarefas(proc, cache)
-    a.update({
-        "timestamp_utc": ts, "hostname": HOSTNAME, "placa_nome": placa["placa_nome"],
-        "origem": "SIMULADA_BANCADA", "uptime_proc_s": max(0, int(time.time() - proc.create_time())),
-        "fator_tempo": fator_tempo, "qtd_tarefas": tarefas, "modo_execucao": "voo",
-        "intervalo_coleta_s": INTERVALO_COLETA_S, "sessao_origem": metadados.get("sessao_origem"),
-        "fase": metadados.get("fase") or "NAO_DETERMINADA",
-    })
-    if "CPU" in comp:
-        nucleos = psutil.cpu_count(logical=True) or 1
-        a.update({"cpu_percent": cpu_bruto, "cpu_nucleos": nucleos, "cpu_pct_host": cpu_bruto / nucleos,
-                  "cpu_semantica": "soma_percentual_por_nucleo"})
-    if "RAM" in comp:
-        a.update({"ram_usada_bytes": proc.memory_info().rss, "ram_baseline_bytes": baseline_ram,
-                  "ram_total_bytes": RAM_TOTAL_REFERENCIA_BYTES,
-                  "ram_disponivel_bytes": psutil.virtual_memory().available,
-                  "ram_baseline_fonte": "SEM_SUBTRACAO", "ram_medicao_tipo": "RSS_PROCESSO"})
-    if "DISCO" in comp:
-        try:
-            flash = os.path.getsize(os.path.join(cwd, placa["arquivo_flash"]))
-        except FileNotFoundError:
-            flash = 0
-        except (OSError, TypeError):
-            flash = None
-        rc, ru = _ler_contador_io(proc, "read")
-        wc, wu = _ler_contador_io(proc, "write")
-        a.update({"flash_usada_bytes": flash, "flash_total_bytes": FMC_FLASH_TOTAL_BYTES,
-                  "io_leitura_contador_acum": rc, "io_escrita_contador_acum": wc,
-                  "io_leitura_unidade": ru, "io_escrita_unidade": wu})
-    return a
-
-
-def obter_cliente_s3():
-    #Cria cliente S3 com chaves explícitas ou com a cadeia padrão boto3/IAM Role
-    import boto3
-
-    if not BUCKET_NAME:
-        raise ValueError("BUCKET_NAME (ou S3_BUCKET_NAME) não está configurado.")
-    configuracao = {"region_name": AWS_REGION}
-    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-        configuracao["aws_access_key_id"] = AWS_ACCESS_KEY_ID
-        configuracao["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
-        if AWS_SESSION_TOKEN:
-            configuracao["aws_session_token"] = AWS_SESSION_TOKEN
-    elif AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN:
-        raise ValueError(
-            "Credenciais AWS incompletas: configure Access Key e Secret Key juntas, "
-            "ou remova as chaves para usar o perfil/IAM Role."
-        )
-    # Sem chaves explícitas, boto3 usa profile/SSO/variáveis padrão/IAM Role da EC2.
-    return boto3.client("s3", **configuracao)
 
 def buscar_placas_do_banco(hostname):
     # Só leitura. Placas com componente ATIVO no computador cujo hostname = hostname.
@@ -195,7 +150,7 @@ def buscar_placas_do_banco(hostname):
 
 
 def carregar_nomes_placas(hostname):
-    # Banco primeiro; se não vier nada, usa PLACAS do .env; senão, vazio (nunca inventa).
+    # Banco primeiro; se não vier nada, usa PLACAS do .env; senão, vazio
     nomes = buscar_placas_do_banco(hostname)
     if nomes:
         return nomes
@@ -206,6 +161,208 @@ def carregar_nomes_placas(hostname):
     if nomes:
         print("Usando PLACAS do .env (banco sem placas para este hostname).")
     return nomes
+
+
+# ============================================================================
+# 5. COLETA DE MÉTRICAS DE CADA PLACA
+
+def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram):
+    comp = placa["componentes"]
+    a = dict.fromkeys(COLUNAS)  # vazio por padrão: só preenche o que a placa mede
+    cpu_bruto, tarefas = medir_cpu_e_tarefas(proc, cache)
+    a.update({
+        "timestamp_utc": ts, "hostname": HOSTNAME, "placa_nome": placa["placa_nome"],
+        "origem": "SIMULADA_BANCADA", "uptime_proc_s": max(0, int(time.time() - proc.create_time())),
+        "fator_tempo": fator_tempo, "qtd_tarefas": tarefas, "modo_execucao": "voo",
+        "intervalo_coleta_s": INTERVALO_COLETA_S, "sessao_origem": metadados.get("sessao_origem"),
+        "fase": metadados.get("fase") or "NAO_DETERMINADA",
+    })
+    if "CPU" in comp:
+        nucleos = psutil.cpu_count(logical=True) or 1
+        a.update({"cpu_percent": cpu_bruto, "cpu_nucleos": nucleos, "cpu_pct_host": cpu_bruto / nucleos,
+                  "cpu_semantica": "soma_percentual_por_nucleo"})
+    if "RAM" in comp:
+        a.update({"ram_usada_bytes": proc.memory_info().rss, "ram_baseline_bytes": baseline_ram,
+                  "ram_total_bytes": RAM_TOTAL_REFERENCIA_BYTES,
+                  "ram_disponivel_bytes": psutil.virtual_memory().available,
+                  "ram_baseline_fonte": "SEM_SUBTRACAO", "ram_medicao_tipo": "RSS_PROCESSO"})
+    if "DISCO" in comp:
+        try:
+            flash = os.path.getsize(os.path.join(cwd, placa["arquivo_flash"]))
+        except FileNotFoundError:
+            flash = 0
+        except (OSError, TypeError):
+            flash = None
+        rc, ru = _ler_contador_io(proc, "read")
+        wc, wu = _ler_contador_io(proc, "write")
+        a.update({"flash_usada_bytes": flash, "flash_total_bytes": FMC_FLASH_TOTAL_BYTES,
+                  "io_leitura_contador_acum": rc, "io_escrita_contador_acum": wc,
+                  "io_leitura_unidade": ru, "io_escrita_unidade": wu})
+    return a
+
+
+def calibrar_baseline_ram():
+    # Não subtrai o RSS de outro processo; retorna zero para usar RSS observado.
+    return 0
+
+
+def _normalizar_nome_processo(valor):
+    # Normaliza nome de script independentemente do SO e de separadores.
+    
+    # Exemplos equivalentes: bancadaVoo.py, bancada_voo.py e
+    # C:\projeto\bancada-voo.py.
+    
+    nome = str(valor or "").strip().strip('"').strip("'")
+    # Trata caminhos Windows e POSIX mesmo quando o agente roda outro SO.
+    nome = nome.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if nome.endswith(".py"):
+        nome = nome[:-3]
+    return "".join(caractere for caractere in nome if caractere.isalnum())
+
+
+def encontrar_processo_simulador():
+    # Localiza a bancada por nome normalizado; permite configurar o nome alvo.
+    # Por compatibilidade, reconhece o nome padrão configurado e o nome real
+    
+    
+    alvos = {
+        _normalizar_nome_processo(NOME_PROCESSO_ALVO),
+        _normalizar_nome_processo("bancadaVoo.py"),
+    }
+    alvos.discard("")
+    candidatos = {}
+    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            if proc.pid == os.getpid():
+                continue
+            cmd = proc.info.get("cmdline") or []
+            if any(_normalizar_nome_processo(arg) in alvos for arg in cmd[1:]):
+                candidatos[proc.pid] = proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # O processo pode encerrar ou ficar inacessível durante a varredura.
+            continue
+    # Se o mesmo comando também aparecer nos filhos, prefire o processo raiz.
+    for proc in candidatos.values():
+        try:
+            if proc.info.get("ppid") not in candidatos:
+                return proc
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return None
+
+
+def ler_metadados_bancada(proc):
+    # Lê metadados explícitos do simulador;
+    # tolera arquivos de versões antigas.
+    try:
+        with open(os.path.join(proc.cwd(), ARQUIVO_META), encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        if not isinstance(dados, dict):
+            return {}
+        return dados
+    except (OSError, ValueError, TypeError, psutil.Error):
+        return {}
+
+
+def ler_fator_tempo(proc):
+    metadados = ler_metadados_bancada(proc)
+    try:
+        fator = float(metadados.get("acelerador", os.getenv("FATOR_TEMPO", "1")))
+        return fator if fator > 0 else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def medir_cpu_e_tarefas(proc, cache_filhos):
+    # Soma CPU percentual por processo (escala psutil, por núcleo) e threads.
+    cpu_total = proc.cpu_percent(interval=None)
+    tarefas_total = proc.num_threads()
+    vivos = set()
+    try:
+        filhos = proc.children(recursive=True)
+    except psutil.NoSuchProcess:
+        filhos = []
+    for filho in filhos:
+        try:
+            medido = cache_filhos.setdefault(filho.pid, filho)
+            cpu_total += medido.cpu_percent(interval=None)
+            tarefas_total += medido.num_threads()
+            vivos.add(filho.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cache_filhos.pop(filho.pid, None)
+    for pid in list(cache_filhos):
+        if pid not in vivos:
+            del cache_filhos[pid]
+    return cpu_total, tarefas_total
+
+
+def _ler_contador_io(proc, tipo):
+    # Prioriza contadores de bytes; fallback para caracteres fica identificado.
+    try:
+        contadores = proc.io_counters()
+    except (psutil.Error, OSError, AttributeError):
+        return None, "desconhecida"
+    atributo_bytes = f"{tipo}_bytes"
+    atributo_chars = f"{tipo}_chars"
+    valor_bytes = getattr(contadores, atributo_bytes, None)
+    if valor_bytes is not None:
+        return int(valor_bytes), "bytes"
+    valor_chars = getattr(contadores, atributo_chars, None)
+    if valor_chars is not None:
+        return int(valor_chars), "chars"
+    return None, "desconhecida"
+
+
+# ============================================================================
+# 6. PERSISTÊNCIA LOCAL DO BRONZE
+
+def salvar_localmente(amostra, caminho_destino=CAMINHO_CSV):
+    os.makedirs(os.path.dirname(caminho_destino) or ".", exist_ok=True)
+    arquivo_novo = not os.path.exists(caminho_destino)
+    # Preserva o arquivo Bronze anterior como backup se o esquema mudar.
+    if not arquivo_novo and caminho_destino == CAMINHO_CSV:
+        with open(caminho_destino, encoding="utf-8") as arquivo:
+            cabecalho_antigo = arquivo.readline().strip().split(";")
+        if cabecalho_antigo != COLUNAS:
+            backup = f"{caminho_destino}.{int(time.time())}.bak"
+            os.rename(caminho_destino, backup)
+            arquivo_novo = True
+    pd.DataFrame([amostra], columns=COLUNAS).to_csv(
+        caminho_destino, sep=";", mode="a", index=False, header=arquivo_novo,
+        encoding="utf-8",
+    )
+    if caminho_destino == CAMINHO_CSV:
+        cpu_exibida = amostra.get("cpu_pct_host")
+        if cpu_exibida is not None:
+            print(
+                f"[{amostra['timestamp_utc']}] Amostra #{amostra['seq']} | "
+                f"CPU host estimada: {float(cpu_exibida):.1f}%"
+            )
+
+
+# ============================================================================
+# 7. CONTROLE DE ESTADO DA SESSÃO E PUBLICAÇÃO NO S3
+
+def obter_cliente_s3():
+    #Cria cliente S3 com chaves explícitas ou com a cadeia padrão boto3/IAM Role
+    import boto3
+
+    if not BUCKET_NAME:
+        raise ValueError("BUCKET_NAME (ou S3_BUCKET_NAME) não está configurado.")
+    configuracao = {"region_name": AWS_REGION}
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        configuracao["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+        configuracao["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+        if AWS_SESSION_TOKEN:
+            configuracao["aws_session_token"] = AWS_SESSION_TOKEN
+    elif AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY or AWS_SESSION_TOKEN:
+        raise ValueError(
+            "Credenciais AWS incompletas: configure Access Key e Secret Key juntas, "
+            "ou remova as chaves para usar o perfil/IAM Role."
+        )
+    # Sem chaves explícitas, boto3 usa profile/SSO/variáveis padrão/IAM Role da EC2.
+    return boto3.client("s3", **configuracao)
+
 
 def _segmento_s3(valor):
     #Evita barras e caracteres problemáticos em segmentos de chaves S3
@@ -305,133 +462,8 @@ def enviar_lote_nuvem(
         return False
 
 
-def salvar_localmente(amostra, caminho_destino=CAMINHO_CSV):
-    os.makedirs(os.path.dirname(caminho_destino) or ".", exist_ok=True)
-    arquivo_novo = not os.path.exists(caminho_destino)
-    # Preserva o arquivo Bronze anterior como backup se o esquema mudar.
-    if not arquivo_novo and caminho_destino == CAMINHO_CSV:
-        with open(caminho_destino, encoding="utf-8") as arquivo:
-            cabecalho_antigo = arquivo.readline().strip().split(";")
-        if cabecalho_antigo != COLUNAS:
-            backup = f"{caminho_destino}.{int(time.time())}.bak"
-            os.rename(caminho_destino, backup)
-            arquivo_novo = True
-    pd.DataFrame([amostra], columns=COLUNAS).to_csv(
-        caminho_destino, sep=";", mode="a", index=False, header=arquivo_novo,
-        encoding="utf-8",
-    )
-    if caminho_destino == CAMINHO_CSV:
-        cpu_exibida = amostra.get("cpu_pct_host")
-        if cpu_exibida is not None:
-            print(
-                f"[{amostra['timestamp_utc']}] Amostra #{amostra['seq']} | "
-                f"CPU host estimada: {float(cpu_exibida):.1f}%"
-            )
-
-def calibrar_baseline_ram():
-    # Não subtrai o RSS de outro processo; retorna zero para usar RSS observado.
-    return 0
-
-def _normalizar_nome_processo(valor):
-    # Normaliza nome de script independentemente do SO e de separadores.
-    #
-    # Exemplos equivalentes: bancadaVoo.py, bancada_voo.py e
-    # C:\projeto\bancada-voo.py.
-    #
-    nome = str(valor or "").strip().strip('"').strip("'")
-    # Trate caminhos Windows e POSIX mesmo quando o agente roda noutro SO.
-    nome = nome.replace("\\", "/").rsplit("/", 1)[-1].casefold()
-    if nome.endswith(".py"):
-        nome = nome[:-3]
-    return "".join(caractere for caractere in nome if caractere.isalnum())
-
-def encontrar_processo_simulador():
-    # Localiza a bancada por nome normalizado; permite configurar o nome alvo.
-    # Por compatibilidade, reconhece o nome padrão configurado e o nome real
-    # usado neste repositório (bancadaVoo.py), mesmo com underscore/hífen.
-    #
-    alvos = {
-        _normalizar_nome_processo(NOME_PROCESSO_ALVO),
-        _normalizar_nome_processo("bancadaVoo.py"),
-    }
-    alvos.discard("")
-    candidatos = {}
-    for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
-        try:
-            if proc.pid == os.getpid():
-                continue
-            cmd = proc.info.get("cmdline") or []
-            if any(_normalizar_nome_processo(arg) in alvos for arg in cmd[1:]):
-                candidatos[proc.pid] = proc
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            # O processo pode encerrar ou ficar inacessível durante a varredura.
-            continue
-    # Se o mesmo comando também aparecer nos filhos, prefira o processo raiz.
-    for proc in candidatos.values():
-        try:
-            if proc.info.get("ppid") not in candidatos:
-                return proc
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-    return None
-
-def ler_metadados_bancada(proc):
-    # Lê metadados explícitos do simulador; tolera arquivos de versões antigas.
-    try:
-        with open(os.path.join(proc.cwd(), ARQUIVO_META), encoding="utf-8") as arquivo:
-            dados = json.load(arquivo)
-        if not isinstance(dados, dict):
-            return {}
-        return dados
-    except (OSError, ValueError, TypeError, psutil.Error):
-        return {}
-    
-def ler_fator_tempo(proc):
-    # Mantém a interface usada em versões antigas do agente.
-    metadados = ler_metadados_bancada(proc)
-    try:
-        fator = float(metadados.get("acelerador", os.getenv("FATOR_TEMPO", "1")))
-        return fator if fator > 0 else 1.0
-    except (TypeError, ValueError):
-        return 1.0
-    
-def medir_cpu_e_tarefas(proc, cache_filhos):
-    # Soma CPU percentual por processo (escala psutil, por núcleo) e threads.
-    cpu_total = proc.cpu_percent(interval=None)
-    tarefas_total = proc.num_threads()
-    vivos = set()
-    try:
-        filhos = proc.children(recursive=True)
-    except psutil.NoSuchProcess:
-        filhos = []
-    for filho in filhos:
-        try:
-            medido = cache_filhos.setdefault(filho.pid, filho)
-            cpu_total += medido.cpu_percent(interval=None)
-            tarefas_total += medido.num_threads()
-            vivos.add(filho.pid)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            cache_filhos.pop(filho.pid, None)
-    for pid in list(cache_filhos):
-        if pid not in vivos:
-            del cache_filhos[pid]
-    return cpu_total, tarefas_total
-
-def _ler_contador_io(proc, tipo):
-    # Prioriza contadores de bytes; fallback para caracteres fica identificado.
-    try:
-        contadores = proc.io_counters()
-    except (psutil.Error, OSError, AttributeError):
-        return None, "desconhecida"
-    atributo_bytes = f"{tipo}_bytes"
-    atributo_chars = f"{tipo}_chars"
-    valor_bytes = getattr(contadores, atributo_bytes, None)
-    if valor_bytes is not None:
-        return int(valor_bytes), "bytes"
-    valor_chars = getattr(contadores, atributo_chars, None)
-    if valor_chars is not None:
-        return int(valor_chars), "chars"
-    return None, "desconhecida"
+# ============================================================================
+# 8. DETECÇÃO E LEITURA DA BANCADA SIMULADA
 
 def detectar_modo_automatico(janela_s=None):
     # Escolhe uma vez: bancada ativa = coleta real; senão = semana sintética.
@@ -447,8 +479,10 @@ def detectar_modo_automatico(janela_s=None):
         # Dá alguns segundos para a bancada iniciar, sem pedir um modo no terminal.
         time.sleep(min(0.5, restante))
 
+
 def obter_placas_real(metadados, simulador, nomes_placas):
-    # Prioridade: placas do meta da bancada. Sem isso, usa os nomes lidos uma vez no início.
+    # Prioridade: placas do meta da bancada. 
+    # Sem isso, usa os nomes lidos uma vez no início.
     placas = carregar_placas(metadados)
     if placas:
         return placas
@@ -457,6 +491,9 @@ def obter_placas_real(metadados, simulador, nomes_placas):
                        "componentes": COMPONENTES_TODOS, "arquivo_flash": ARQUIVO_FLASH})
     return placas
 
+
+# ============================================================================
+# 9. EXECUÇÃO EM MODO REAL: COLETA CONTÍNUA DA BANCADA
 
 def rodar_modo_real(simulador_inicial=None):
     print(
@@ -513,13 +550,13 @@ def rodar_modo_real(simulador_inicial=None):
                 try:
                     if nome not in procs_placa:
                         proc, cache = psutil.Process(placa["pid"]), {}
-                        medir_cpu_e_tarefas(proc, cache)  # aquece contador; sem linha neste ciclo
+                        medir_cpu_e_tarefas(proc, cache)  # aquece contador;
                         procs_placa[nome] = (proc, cache)
                         continue
                     proc, cache = procs_placa[nome]
                     amostra = amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram)
                 except psutil.Error:
-                    procs_placa.pop(nome, None)  # processo sumiu; não sintetiza linha
+                    procs_placa.pop(nome, None)  # se o processo sumiu não sintetiza linha
                     continue
                 seq_placa[nome] = seq_placa.get(nome, 0) + 1
                 amostra["seq"] = seq_placa[nome]
@@ -539,6 +576,10 @@ def rodar_modo_real(simulador_inicial=None):
             print("Bronze foi mantido localmente, mas o envio final ao S3 falhou.")
     print(f"Coleta encerrada. Bronze real salvo em {CAMINHO_CSV} ({sum(seq_placa.values())} novas amostras).")
 
+
+# ============================================================================
+# 10. GERAÇÃO DOS DADOS SINTÉTICOS: ESTADO E AGENDA DE VOOS
+
 def estado_simulado_voo(instante_atual, agenda_de_voos):
     for partida, chegada in agenda_de_voos:
         if partida <= instante_atual < chegada:
@@ -548,6 +589,7 @@ def estado_simulado_voo(instante_atual, agenda_de_voos):
                 return 72, True
             return 38, True
     return 12, False
+
 
 def fase_semana(instante_atual, agenda_de_voos):
     # O modo semanal não simula as dez fases detalhadas do roteiro da bancada.
@@ -559,6 +601,7 @@ def fase_semana(instante_atual, agenda_de_voos):
                 return "TRANSICAO"
             return "EM_VOO"
     return "SOLO"
+
 
 def criar_agenda_simples(data_inicio):
     fuso = timezone(timedelta(hours=-3))
@@ -581,6 +624,10 @@ def criar_agenda_simples(data_inicio):
             hora_da_partida = hora_da_chegada + timedelta(minutes=rng.choice([40, 45, 50]))
     return agenda
 
+
+# ============================================================================
+# 11. EXECUÇÃO EM MODO SEMANA: GERAÇÃO DE TELEMETRIA SINTÉTICA
+
 def rodar_modo_semana(data_inicio, enviar_s3):
     # O modo é escolhido uma vez na inicialização: sem bancada ativa, gera a semana sintética.
     # Depois de escolhido, não fica verificando nem cancela a geração no meio do caminho.
@@ -600,7 +647,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
     nomes_placas = carregar_nomes_placas(HOSTNAME_SEMANA)
     if not nomes_placas:
         raise RuntimeError("Sem placas: cadastre no banco (hostname igual a HOSTNAME_SEMANA) ou defina PLACAS no .env.")
-    
+
     for placa in placas:
         estado[placa["placa_nome"]] = {"ruido_cpu": 0.0, "ruido_ram": 0.0, "io_escrita": 0, "io_leitura": 0}
 
@@ -670,6 +717,7 @@ def rodar_modo_semana(data_inicio, enviar_s3):
                 })
 
             linhas_do_csv.append(pacote)
+
     # Toda a semana cabe em um Bronze único; cada linha representa uma amostra de 5 minutos.
     sessao_semana = f"SEMANA-{data_inicio.isoformat()}-{INICIO_EXECUCAO}"
     caminho_semana = os.getenv("CAMINHO_SEMANA", f"bronze_semana_{INICIO_EXECUCAO}.csv")
@@ -702,6 +750,10 @@ def rodar_modo_semana(data_inicio, enviar_s3):
             "Execute com --enviar-s3 para habilitar."
         )
 
+
+# ============================================================================
+# 12. ORQUESTRAÇÃO AUTOMÁTICA E ENTRADA PELO TERMINAL
+
 def executar_automaticamente(data_inicio=None, enviar_s3=False):
     # Usa coleta real se encontrar a bancada; sem ela, gera o Bronze semanal.
     modo, simulador = detectar_modo_automatico()
@@ -716,8 +768,10 @@ def executar_automaticamente(data_inicio=None, enviar_s3=False):
     rodar_modo_semana(data_inicio, enviar_s3)
     return "semana"
 
+
 if __name__ == "__main__":
     import argparse
+
     # o próprio agente decide qual fonte usar.
     terminal = argparse.ArgumentParser(description="Agente AirPulse com seleção automática de fonte")
     terminal.add_argument("--inicio", default=None, help="Data inicial opcional do semanal (AAAA-MM-DD).")

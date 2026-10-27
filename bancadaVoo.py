@@ -1,44 +1,56 @@
+# Simulador AirPulse: gera cenários de telemetria para a bancada de voo.
+# A execução altera o uso real de CPU, RAM e disco; utilize com atenção.
+
+# =============================================================================
+# 1. IMPORTAÇÕES
+
 import os
-from dotenv import load_dotenv
-import socket
 import json
 import time
 import random
 import argparse
 import multiprocessing as mp
+import socket
+from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
+
 import psutil
 
 
-# GERENCIADOR DE MEMÓRIA RAM
+# =============================================================================
+# 2. CONFIGURAÇÕES E ESTADO DO GERENCIADOR DE RAM
 
 blocos_de_memoria_ram = []
-#TAMANHO_DO_BLOCO_BYTES = 50 * 1024 * 1024  # Tijolos de 50 Megabytes
-#Se usar RAM simulada de 4mb
+# TAMANHO_DO_BLOCO_BYTES = 50 * 1024 * 1024  # Tijolos de 50 Megabytes
+# Se usar RAM simulada de 4mb
 TAMANHO_DO_BLOCO_BYTES = 1 * 1024 * 1024
 MARGEM_SEGURANCA = 0.10                    # Nunca deixa o PC com menos de 10% de RAM
 RAM_MAX_PCT = 85                           # Teto de segurança (85% da RAM total do PC)
 
+
+# =============================================================================
+# 3. GERENCIAMENTO DE MEMÓRIA RAM
+
 def ajustar_memoria_ram(porcentagem_desejada):
     # Calcula quantos tijolos de 50MB precisamos criar ou destruir para bater a meta de RAM.
     global blocos_de_memoria_ram
-    
+
     memoria_do_pc = psutil.virtual_memory()
-    
+
     # Garante que não vamos pedir mais do que o limite de 85%
     porcentagem_desejada = min(porcentagem_desejada, RAM_MAX_PCT)
-    
+
     # Descobre quantos tijolos de 50MB precisamos no total
     bytes_alvo = memoria_do_pc.total * (porcentagem_desejada / 100)
     blocos_necessarios = int(bytes_alvo / TAMANHO_DO_BLOCO_BYTES)
 
     blocos_faltantes = blocos_necessarios - len(blocos_de_memoria_ram)
-    
+
     # Trava de segurança: Se o PC estiver ficando sem memória real, limitamos a alocação
     if blocos_faltantes > 0:
         memoria_de_folga = memoria_do_pc.available - (MARGEM_SEGURANCA * memoria_do_pc.total)
         blocos_que_cabem_na_folga = int(max(0, memoria_de_folga) // TAMANHO_DO_BLOCO_BYTES)
-        
+
         if blocos_que_cabem_na_folga < blocos_faltantes:
             print(f"PC sem memória real suficiente. Limitando a {blocos_que_cabem_na_folga} blocos extras.")
             blocos_necessarios = len(blocos_de_memoria_ram) + blocos_que_cabem_na_folga
@@ -47,27 +59,29 @@ def ajustar_memoria_ram(porcentagem_desejada):
     while len(blocos_de_memoria_ram) < blocos_necessarios:
         novo_bloco = bytearray(b"\x01") * TAMANHO_DO_BLOCO_BYTES
         blocos_de_memoria_ram.append(novo_bloco)
-        
-    # Se sobejou blocos, joga fora
+
+    # Se sobrou blocos, joga fora
     while len(blocos_de_memoria_ram) > blocos_necessarios:
         blocos_de_memoria_ram.pop()
 
 
-# GERENCIADOR DE CPU E DISCO
+# =============================================================================
+# 4. GERENCIAMENTO DE CPU E DISCO
 
 def estressar_cpu_processador(meta_de_uso_compartilhada, sinal_de_parada):
     # Trabalha e dorme em frações de segundo para bater a meta exata de CPU.
     while not sinal_de_parada.is_set():
         tempo_trabalhando = meta_de_uso_compartilhada.value * 0.1
         tempo_inicio = time.perf_counter()
-        
+
         # Loop vazio: força a CPU a 100% durante esse micro-intervalo
         while time.perf_counter() - tempo_inicio < tempo_trabalhando:
             pass
-            
+
         # Dorme o resto do tempo para a média cair para o valor desejado
         tempo_para_dormir = 0.1 - tempo_trabalhando
         time.sleep(max(0, tempo_para_dormir))
+
 
 def gravar_arquivos_no_disco(fator_escrita, kb_extra=0):
     # Escreve dados falsos na 'Flash' para gerar desgaste e I/O reais.
@@ -75,12 +89,13 @@ def gravar_arquivos_no_disco(fator_escrita, kb_extra=0):
         # Sorteia entre 10KB e 50KB e multiplica pela aceleração e pelos extras do cenário
         quantidade_kb = random.randint(10, 50) * fator_escrita + kb_extra
         quantidade_de_bytes = int(1024 * quantidade_kb)
-        
+
         bytes_aleatorios = os.urandom(quantidade_de_bytes)
         arquivo.write(bytes_aleatorios)
 
 
-# ROTEIRO DO VOO E CENÁRIOS
+# =============================================================================
+# 5. ROTEIRO DO VOO E CENÁRIOS DE ANOMALIA
 
 FASES_DO_VOO = [
     {"nome": "BOOT",      "minutos": 1,  "uso_cpu": 65, "uso_ram": 0},
@@ -108,38 +123,46 @@ CENARIOS = {
     ],
 }
 
+
+# =============================================================================
+# 6. CÁLCULO DOS ALVOS E APLICAÇÃO DAS ANOMALIAS
+
 def calcular_alvos_neste_segundo(fase_atual, porcentagem_concluida_da_fase, anomalias_ativas):
     # Verifica se neste exato momento existe alguma anomalia substituindo os valores normais.
     cpu = fase_atual["uso_cpu"]
     ram = fase_atual["uso_ram"]
     kb_extra_flash = 0
-    
+
     for anomalia in anomalias_ativas:
         # Se a anomalia não é para a fase atual, ou o tempo dela ainda não chegou, ignora
         if anomalia["fase"] != fase_atual["nome"] or porcentagem_concluida_da_fase < anomalia["de"]:
             continue
-            
+
         # Se for um pico de CPU e estiver dentro do período
         if anomalia["tipo"] == "cpu" and porcentagem_concluida_da_fase <= anomalia["ate"]:
             cpu = anomalia["valor"]
-            
+
         # Se for um vazamento de RAM (vai subindo aos poucos até o limite e trava)
         elif anomalia["tipo"] == "ram_rampa":
             tamanho_do_periodo = anomalia["ate"] - anomalia["de"]
-            if tamanho_do_periodo <= 0: tamanho_do_periodo = 0.001 # Evita divisão por zero
-            
+            if tamanho_do_periodo <= 0:
+                tamanho_do_periodo = 0.001  # Evita divisão por zero
+
             progresso_da_anomalia = (porcentagem_concluida_da_fase - anomalia["de"]) / tamanho_do_periodo
-            progresso_da_anomalia = min(1.0, progresso_da_anomalia) # Trava em 100% do crescimento
-            
+            progresso_da_anomalia = min(1.0, progresso_da_anomalia)  # Trava em 100% do crescimento
+
             diferenca = anomalia["valor"] - fase_atual["uso_ram"]
             ram = fase_atual["uso_ram"] + (diferenca * progresso_da_anomalia)
-            
+
         # Se for rajada de gravação na Flash
         elif anomalia["tipo"] == "flash" and porcentagem_concluida_da_fase <= anomalia["ate"]:
             kb_extra_flash += anomalia["valor"]
-            
+
     return cpu, ram, kb_extra_flash
 
+
+# =============================================================================
+# 7. PERSISTÊNCIA DOS METADADOS DA BANCADA
 
 def gravar_metadados_atomicos(caminho, metadados):
     # Atualiza os metadados sem expor JSON parcialmente escrito ao agente.
@@ -149,8 +172,8 @@ def gravar_metadados_atomicos(caminho, metadados):
     os.replace(temporario, caminho)
 
 
-
-# EXECUÇÃO PRINCIPAL
+# =============================================================================
+# 8. INICIALIZAÇÃO E ARGUMENTOS DE EXECUÇÃO
 
 if __name__ == "__main__":
     # Permite escolher o cenário via linha de comando
@@ -160,6 +183,7 @@ if __name__ == "__main__":
     terminal.add_argument("--ram-max-pct", type=float, default=RAM_MAX_PCT)
     args = terminal.parse_args()
 
+    # Validação dos parâmetros recebidos
     if args.acelerador <= 0:
         terminal.error("--acelerador deve ser maior que zero.")
     if not 0 < args.ram_max_pct <= 100:
@@ -189,16 +213,25 @@ if __name__ == "__main__":
     }
     gravar_metadados_atomicos(caminho_meta, meta_base)
 
+    # =============================================================================
+    # 9. INICIALIZAÇÃO DOS PROCESSOS DE CPU
+
     # LIGA OS MOTORES DA CPU EM SEGUNDO PLANO
     meta_cpu_atual = mp.Value("d", 0.0)
     sinal_desligar_cpu = mp.Event()
-    
+
     for _ in range(os.cpu_count()):
-        motor = mp.Process(target=estressar_cpu_processador, args=(meta_cpu_atual, sinal_desligar_cpu))
+        motor = mp.Process(
+            target=estressar_cpu_processador,
+            args=(meta_cpu_atual, sinal_desligar_cpu),
+        )
         motor.daemon = True
         motor.start()
 
     gabarito = {"cenario": args.cenario, "acelerador": ACELERADOR_DE_TEMPO, "anomalias": []}
+
+    # =============================================================================
+    # 10. EXECUÇÃO DAS FASES DO VOO
     
     try:
         # Percorre todas as fases do voo
@@ -217,36 +250,52 @@ if __name__ == "__main__":
             }
             gravar_metadados_atomicos(caminho_meta, metadados_fase)
 
-            print(f"Fase: {fase['nome']:<10} | Duração: {segundos_reais_espera:.1f}s | CPU Base: {fase['uso_cpu']}% | RAM Base: {fase['uso_ram']}%")
+            print(
+                f"Fase: {fase['nome']:<10} | Duração: {segundos_reais_espera:.1f}s | "
+                f"CPU Base: {fase['uso_cpu']}% | RAM Base: {fase['uso_ram']}%"
+            )
 
             # Salva no gabarito os horários exatos que as anomalias vão acontecer
             for a in anomalias_escolhidas:
                 if a["fase"] == fase["nome"]:
                     inicio_anomalia = inicio_fase + (a["de"] * segundos_reais_espera)
-                    fim_anomalia = inicio_fase + ((1 if a["tipo"] == "ram_rampa" else a["ate"]) * segundos_reais_espera)
-                    
+                    fim_anomalia = inicio_fase + (
+                        (1 if a["tipo"] == "ram_rampa" else a["ate"]) * segundos_reais_espera
+                    )
+
                     anomalia_com_datas = a.copy()
-                    anomalia_com_datas["inicio_utc"] = datetime.fromtimestamp(inicio_anomalia, timezone.utc).isoformat()
-                    anomalia_com_datas["fim_utc"] = datetime.fromtimestamp(fim_anomalia, timezone.utc).isoformat()
+                    anomalia_com_datas["inicio_utc"] = datetime.fromtimestamp(
+                        inicio_anomalia, timezone.utc
+                    ).isoformat()
+                    anomalia_com_datas["fim_utc"] = datetime.fromtimestamp(
+                        fim_anomalia, timezone.utc
+                    ).isoformat()
                     gabarito["anomalias"].append(anomalia_com_datas)
 
             # Loop de execução segundo a segundo
             while time.time() < fim_fase:
                 porcentagem_concluida = (time.time() - inicio_fase) / segundos_reais_espera
-                metadados_fase["progresso_fase_pct"] = min(100.0, max(0.0, porcentagem_concluida * 100))
+                metadados_fase["progresso_fase_pct"] = min(
+                    100.0, max(0.0, porcentagem_concluida * 100)
+                )
                 gravar_metadados_atomicos(caminho_meta, metadados_fase)
 
                 # 1. Calcula o alvo exato
-                cpu_alvo, ram_alvo, kb_extra = calcular_alvos_neste_segundo(fase, porcentagem_concluida, anomalias_escolhidas)
-                
+                cpu_alvo, ram_alvo, kb_extra = calcular_alvos_neste_segundo(
+                    fase, porcentagem_concluida, anomalias_escolhidas
+                )
+
                 # 2. Aplica o esforço
                 meta_cpu_atual.value = cpu_alvo / 100.0
                 ajustar_memoria_ram(ram_alvo)
                 gravar_arquivos_no_disco(fator_escrita, kb_extra * fator_escrita)
-                
+
                 # Aguarda 1 segundo antes do próximo ciclo
                 time.sleep(1)
-                
+
+    # =============================================================================
+    # 11. ENCERRAMENTO E SALVAMENTO DO GABARITO
+    
     finally:
         # Quando acaba, abaixa a bandeira para desligar os processos de CPU e salva o gabarito
         sinal_desligar_cpu.set()
