@@ -1,1 +1,5 @@
 .env
+bancada_meta.json
+bancada_gabarito.json
+bronze_ativo.json
+fmc_flash_bite.log

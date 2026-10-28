@@ -1,0 +1,25 @@
+[
+  {
+    "hostname":"GERADOR_SINTETICO",
+    "computador_id":1,
+    "tipo_fmc":"MESTRE",
+    "status_computador":"ATIVO",
+    "aeronave_id":1,
+    "aeronave_nome":"PR-AER",
+    "aeronave_modelo":"Boeing 737-8",
+    "companhia_aerea":"GOL",
+    "empresa_id":2,
+    "empresa_nome":"AeroNova",
+    "ultima_amostra_utc":"2026-10-27T02:55:00+00:00",
+    "placas_monitoradas":3,
+    "placas_com_alerta":0,
+    "alertas_abertos":0,
+    "alertas_criticos_abertos":0,
+    "alertas_atencao_abertos":0,
+    "completude_pct":100.0,
+    "health_score":94.8,
+    "health_score_status":"OK",
+    "pior_placa":"PL-1-P01",
+    "estado_saude":"SEM_ALERTAS_ATIVOS"
+  }
+]

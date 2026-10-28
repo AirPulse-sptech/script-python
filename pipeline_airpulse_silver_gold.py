@@ -307,10 +307,6 @@ def carregar_bronze_s3(*, bucket=None, s3_key=None, hostname=None, manifest_key=
 # Carrega o cadastro, normaliza chaves e associa hostname, placa, componentes e limites.
 
 
-def _segmento_s3(valor):
-    # Troca sequências de caracteres fora de [A-Za-z0-9._-] por "_" e nunca devolve vazio.
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(valor or "desconhecido").strip()).strip("._-") or "desconhecido"
-
 def _chave_texto(serie: pd.Series):
     # Compara texto sem diferenciar maiúsculas/minúsculas (Windows costuma devolver hostname em MAIÚSCULAS).
     return serie.astype(str).str.strip().str.lower() 
@@ -776,9 +772,9 @@ def _limites_do_grupo(grupo: pd.DataFrame, metrica: str):
     vazio = pd.Series(dtype=float)
     atencao = pd.to_numeric(grupo.get(f"limiar_{metrica}_atencao", vazio), errors="coerce").dropna().unique()
     critico = pd.to_numeric(grupo.get(f"limiar_{metrica}_critico", vazio), errors="coerce").dropna().unique()
-    if len(atencao) != 1 or len(critico) != 1:
+    if not atencao[0] < critico[0]:
         return None
-    return _limiar_valido({metrica: (atencao[0], critico[0])}, metrica)
+    return float(atencao[0]), float(critico[0])
 
 def _calcular_health_score(grupo: pd.DataFrame, completude: float):
     # Score por severidade máxima por amostra; crítico não acumula atenção também.
@@ -1269,6 +1265,7 @@ def quarentenar(df_silver, mascara, sufixo, timestamp):
 #============================================================================================================================================
 # BLOCO 9: EXECUÇÃO DO PIPELINE
 # Interpreta argumentos, executa Bronze -> Silver -> Gold, salva os arquivos e publica no S3.
+
 if __name__ == "__main__":
     terminal = argparse.ArgumentParser(
         description="Pipeline ETL AirPulse: Bronze no local ou S3 -> Silver -> Gold"

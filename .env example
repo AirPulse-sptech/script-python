@@ -1,0 +1,28 @@
+# Agente
+NOME_PROCESSO_ALVO=bancadaVoo
+INTERVALO_COLETA_S=10
+PLACAS=P01,P02,P03
+HOSTNAME_SEMANA=GERADOR_SINTETICO
+PLACAS_SEMANA=P01:CPU,RAM,DISCO;P02:RAM;P03:DISCO
+#ARQUIVO_BRONZE=caminho do arquivo se for ler local e não quiser que seja o semanal simulado. 
+
+# ETL
+JANELA_DETECCAO_BANCADA_S=5
+
+# AWS S3 (deixe em branco para rodar só localmente)
+#AWS_REGION=us-east-1
+aws_access_key_id=
+aws_secret_access_key=
+aws_session_token=
+#Buckets 
+BUCKET_NAME=mateus-airpulse
+ENVIAR_S3=true
+# MySQL
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=Airpulse
+DB_USER=root
+DB_PASSWORD=
+#Urubu100
+
+RAM_TOTAL_BYTES=4194304 #é opcional; normalmente usa o total de RAM do host automaticamente.
