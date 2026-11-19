@@ -9,6 +9,8 @@ import json
 import time
 import random
 import argparse
+from pathlib import Path
+from tempfile import gettempdir
 import multiprocessing as mp
 import socket
 from dotenv import load_dotenv
@@ -83,9 +85,9 @@ def estressar_cpu_processador(meta_de_uso_compartilhada, sinal_de_parada):
         time.sleep(max(0, tempo_para_dormir))
 
 
-def gravar_arquivos_no_disco(fator_escrita, kb_extra=0):
+def gravar_arquivos_no_disco(caminho_flash, fator_escrita, kb_extra=0):
     # Escreve dados falsos na 'Flash' para gerar desgaste e I/O reais.
-    with open("fmc_flash_bite.log", "ab") as arquivo:
+    with caminho_flash.open("ab") as arquivo:
         # Sorteia entre 10KB e 50KB e multiplica pela aceleração e pelos extras do cenário
         quantidade_kb = random.randint(10, 50) * fator_escrita + kb_extra
         quantidade_de_bytes = int(1024 * quantidade_kb)
@@ -176,6 +178,7 @@ def gravar_metadados_atomicos(caminho, metadados):
 # 8. INICIALIZAÇÃO E ARGUMENTOS DE EXECUÇÃO
 
 if __name__ == "__main__":
+    load_dotenv(Path(__file__).resolve().parents[1] / "config" / ".env")
     # Permite escolher o cenário via linha de comando
     terminal = argparse.ArgumentParser(description="Simulador de Hardware FMC")
     terminal.add_argument("--cenario", choices=list(CENARIOS), default=os.getenv("CENARIO", "normal"))
@@ -196,44 +199,38 @@ if __name__ == "__main__":
 
     print(f"LIGANDO O SIMULADOR... (PID {os.getpid()}) | cenário: {args.cenario} | acelerador: {ACELERADOR_DE_TEMPO:g}x")
 
-    # Limpa a lixeira do voo antigo
-    if os.path.exists("fmc_flash_bite.log"):
-        os.remove("fmc_flash_bite.log")
+    pasta_bancada = Path(gettempdir()) / "airpulse" / f"bancada-{os.getpid()}"
+    pasta_bancada.mkdir(parents=True, exist_ok=True)
+    caminho_meta = pasta_bancada / "bancada_meta.json"
+    caminho_flash = pasta_bancada / "fmc_flash_bite.log"
 
-    # Metadados lidos pelo agente: fase explícita evita inferência cega por uptime.
+    # Metadados lidos pelo agente: fase explícita evita inferência por uptime.
     sessao_origem = datetime.now(timezone.utc).strftime("VOO-%Y%m%dT%H%M%S.%fZ")
-    caminho_meta = os.path.abspath("bancada_meta.json")
     meta_base = {
         "acelerador": ACELERADOR_DE_TEMPO,
         "cenario": args.cenario,
         "sessao_origem": sessao_origem,
         "fase": "INICIALIZANDO",
         "modo_execucao": "voo",
+        "arquivo_flash": str(caminho_flash),
         "intervalo_coleta_s": float(os.getenv("INTERVALO_COLETA_S", "10")),
     }
-    gravar_metadados_atomicos(caminho_meta, meta_base)
-
-    # =============================================================================
-    # 9. INICIALIZAÇÃO DOS PROCESSOS DE CPU
-
-    # LIGA OS MOTORES DA CPU EM SEGUNDO PLANO
     meta_cpu_atual = mp.Value("d", 0.0)
     sinal_desligar_cpu = mp.Event()
 
-    for _ in range(os.cpu_count()):
-        motor = mp.Process(
-            target=estressar_cpu_processador,
-            args=(meta_cpu_atual, sinal_desligar_cpu),
-        )
-        motor.daemon = True
-        motor.start()
-
-    gabarito = {"cenario": args.cenario, "acelerador": ACELERADOR_DE_TEMPO, "anomalias": []}
-
-    # =============================================================================
-    # 10. EXECUÇÃO DAS FASES DO VOO
-    
     try:
+        caminho_flash.write_bytes(b"")
+        gravar_metadados_atomicos(caminho_meta, meta_base)
+
+        # Liga a carga de CPU em segundo plano.
+        for _ in range(os.cpu_count()):
+            motor = mp.Process(
+                target=estressar_cpu_processador,
+                args=(meta_cpu_atual, sinal_desligar_cpu),
+            )
+            motor.daemon = True
+            motor.start()
+
         # Percorre todas as fases do voo
         for fase in FASES_DO_VOO:
             segundos_reais_espera = (fase["minutos"] * 60) / ACELERADOR_DE_TEMPO
@@ -255,23 +252,6 @@ if __name__ == "__main__":
                 f"CPU Base: {fase['uso_cpu']}% | RAM Base: {fase['uso_ram']}%"
             )
 
-            # Salva no gabarito os horários exatos que as anomalias vão acontecer
-            for a in anomalias_escolhidas:
-                if a["fase"] == fase["nome"]:
-                    inicio_anomalia = inicio_fase + (a["de"] * segundos_reais_espera)
-                    fim_anomalia = inicio_fase + (
-                        (1 if a["tipo"] == "ram_rampa" else a["ate"]) * segundos_reais_espera
-                    )
-
-                    anomalia_com_datas = a.copy()
-                    anomalia_com_datas["inicio_utc"] = datetime.fromtimestamp(
-                        inicio_anomalia, timezone.utc
-                    ).isoformat()
-                    anomalia_com_datas["fim_utc"] = datetime.fromtimestamp(
-                        fim_anomalia, timezone.utc
-                    ).isoformat()
-                    gabarito["anomalias"].append(anomalia_com_datas)
-
             # Loop de execução segundo a segundo
             while time.time() < fim_fase:
                 porcentagem_concluida = (time.time() - inicio_fase) / segundos_reais_espera
@@ -288,17 +268,17 @@ if __name__ == "__main__":
                 # 2. Aplica o esforço
                 meta_cpu_atual.value = cpu_alvo / 100.0
                 ajustar_memoria_ram(ram_alvo)
-                gravar_arquivos_no_disco(fator_escrita, kb_extra * fator_escrita)
+                gravar_arquivos_no_disco(caminho_flash, fator_escrita, kb_extra * fator_escrita)
 
                 # Aguarda 1 segundo antes do próximo ciclo
                 time.sleep(1)
 
     # =============================================================================
-    # 11. ENCERRAMENTO E SALVAMENTO DO GABARITO
-    
+    # 11. ENCERRAMENTO
     finally:
-        # Quando acaba, abaixa a bandeira para desligar os processos de CPU e salva o gabarito
         sinal_desligar_cpu.set()
-        with open("bancada_gabarito.json", "w", encoding="utf-8") as f:
-            json.dump(gabarito, f, ensure_ascii=False, indent=2)
+        caminho_flash.unlink(missing_ok=True)
+        caminho_meta.unlink(missing_ok=True)
+        caminho_meta.with_suffix(".json.tmp").unlink(missing_ok=True)
+        pasta_bancada.rmdir()
         print("Simulação do Voo Encerrada. Pode fechar o simulador.")

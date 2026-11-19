@@ -12,13 +12,15 @@ import random
 import re
 import socket
 import time
+from pathlib import Path
+from tempfile import gettempdir
 from datetime import date, datetime, timedelta, timezone, time as hora
 
 import pandas as pd
 import psutil
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+load_dotenv(Path(__file__).resolve().parents[1] / "config" / ".env", override=True)
 
 
 # ============================================================================
@@ -39,13 +41,16 @@ SESSAO_EXECUCAO = INICIO_EXECUCAO
 NOME_OBJETO_S3 = f"{HOSTNAME}_{INICIO_EXECUCAO}.csv"
 
 # Cada execução usa um CSV local independente: amostras antigas não entram na sessão nova.
-CAMINHO_CSV = f"bronze_bruto_{NOME_OBJETO_S3}"
+PASTA_DADOS = os.path.join(gettempdir(), "airpulse")
+CAMINHO_CSV = os.path.join(PASTA_DADOS, f"bronze_bruto_{NOME_OBJETO_S3}")
 INTERVALO_COLETA_S = max(1, int(os.getenv("INTERVALO_COLETA_S", "2")))
 AMOSTRAS_POR_LOTE = max(1, 60 // INTERVALO_COLETA_S)
 RAM_TOTAL_REFERENCIA_BYTES = int(os.getenv("RAM_TOTAL_BYTES", psutil.virtual_memory().total))
 FMC_FLASH_TOTAL_BYTES = 32 * 1024 * 1024
 NOME_PROCESSO_ALVO = os.getenv("NOME_PROCESSO_ALVO", "bancada_voo")
-ARQUIVO_ESTADO_BRONZE = os.getenv("ARQUIVO_ESTADO_BRONZE", "bronze_ativo.json")
+ARQUIVO_ESTADO_BRONZE = os.path.join(
+    PASTA_DADOS, os.getenv("ARQUIVO_ESTADO_BRONZE", "bronze_ativo.json"),
+)
 JANELA_DETECCAO_BANCADA_S = max(0.0, float(os.getenv("JANELA_DETECCAO_BANCADA_S", "5")))
 ARQUIVO_FLASH = "fmc_flash_bite.log"
 ARQUIVO_META = "bancada_meta.json"
@@ -255,7 +260,10 @@ def ler_metadados_bancada(proc):
     # Lê metadados explícitos do simulador;
     # tolera arquivos de versões antigas.
     try:
-        with open(os.path.join(proc.cwd(), ARQUIVO_META), encoding="utf-8") as arquivo:
+        caminho = os.path.join(PASTA_DADOS, f"bancada-{proc.pid}", ARQUIVO_META)
+        if not os.path.exists(caminho):
+            caminho = os.path.join(proc.cwd(), ARQUIVO_META)
+        with open(caminho, encoding="utf-8") as arquivo:
             dados = json.load(arquivo)
         if not isinstance(dados, dict):
             return {}
@@ -400,6 +408,7 @@ def registrar_bronze_ativo(
         "data_inicio": data_inicio.isoformat() if data_inicio else None,
     }
     # Substituição atômica evita que outro processo leia um JSON pela metade.
+    os.makedirs(os.path.dirname(ARQUIVO_ESTADO_BRONZE) or ".", exist_ok=True)
     temporario = f"{ARQUIVO_ESTADO_BRONZE}.tmp"
     with open(temporario, "w", encoding="utf-8") as arquivo:
         json.dump(estado, arquivo, ensure_ascii=False, indent=2)
@@ -414,6 +423,15 @@ def registrar_bronze_ativo(
             ContentType="application/json",
         )
         print(f"Manifesto publicado: s3://{BUCKET_NAME}/{chave_manifesto}")
+        if estado_coleta == "CONCLUIDA":
+            # O marcador por sessão dispara a ETL só depois do upload completo.
+            chave_concluida = f"{os.path.splitext(chave_s3)[0]}_concluido.json"
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key=chave_concluida,
+                Body=json.dumps({"chave_s3": chave_s3}).encode("utf-8"),
+                ContentType="application/json",
+            )
     return estado
 
 
@@ -486,9 +504,10 @@ def obter_placas_real(metadados, simulador, nomes_placas):
     placas = carregar_placas(metadados)
     if placas:
         return placas
+    arquivo_flash = metadados.get("arquivo_flash") or ARQUIVO_FLASH
     for nome in nomes_placas:
         placas.append({"placa_nome": nome, "pid": simulador.pid,
-                       "componentes": COMPONENTES_TODOS, "arquivo_flash": ARQUIVO_FLASH})
+                       "componentes": COMPONENTES_TODOS, "arquivo_flash": arquivo_flash})
     return placas
 
 
@@ -502,7 +521,7 @@ def rodar_modo_real(simulador_inicial=None):
     simulador = simulador_inicial or encontrar_processo_simulador()
     if simulador is None:
         raise RuntimeError("A bancada não foi encontrada para a coleta real.")
-    # A ETL usa este arquivo para saber que deve tratar o Bronze da coleta real.
+    # Registra a sessão para localizar o CSV local do último voo.
     registrar_bronze_ativo(
         CAMINHO_CSV, "real", hostname=HOSTNAME, sessao_id=SESSAO_EXECUCAO,
         estado_coleta="EM_ANDAMENTO",
@@ -629,7 +648,7 @@ def criar_agenda_simples(data_inicio):
 # 11. EXECUÇÃO EM MODO SEMANA: GERAÇÃO DE TELEMETRIA SINTÉTICA
 
 def rodar_modo_semana(data_inicio, enviar_s3):
-    # O modo é escolhido uma vez na inicialização: sem bancada ativa, gera a semana sintética.
+    # Gera a semana sintética somente quando solicitada.
     # Depois de escolhido, não fica verificando nem cancela a geração no meio do caminho.
     print("Modo SEMANA: gerando 7 dias em intervalos de 300 segundos...")
     fuso = timezone(timedelta(hours=-3))
@@ -720,7 +739,10 @@ def rodar_modo_semana(data_inicio, enviar_s3):
 
     # Toda a semana cabe em um Bronze único; cada linha representa uma amostra de 5 minutos.
     sessao_semana = f"SEMANA-{data_inicio.isoformat()}-{INICIO_EXECUCAO}"
-    caminho_semana = os.getenv("CAMINHO_SEMANA", f"bronze_semana_{INICIO_EXECUCAO}.csv")
+    caminho_semana = os.path.join(
+        PASTA_DADOS, os.getenv("CAMINHO_SEMANA", f"bronze_semana_{INICIO_EXECUCAO}.csv"),
+    )
+    os.makedirs(os.path.dirname(caminho_semana) or ".", exist_ok=True)
     pd.DataFrame(linhas_do_csv, columns=COLUNAS).to_csv(
         caminho_semana, sep=";", index=False, encoding="utf-8"
     )
@@ -754,29 +776,31 @@ def rodar_modo_semana(data_inicio, enviar_s3):
 # ============================================================================
 # 12. ORQUESTRAÇÃO AUTOMÁTICA E ENTRADA PELO TERMINAL
 
-def executar_automaticamente(data_inicio=None, enviar_s3=False):
-    # Usa coleta real se encontrar a bancada; sem ela, gera o Bronze semanal.
+def executar_automaticamente(data_inicio=None, enviar_s3=False, *, semana=False):
+    if semana or data_inicio is not None:
+        # Usa os últimos sete dias completos para não gerar timestamps no futuro.
+        data_inicio = data_inicio or date.today() - timedelta(days=7)
+        rodar_modo_semana(data_inicio, enviar_s3)
+        return "semana"
+
     modo, simulador = detectar_modo_automatico()
     if modo == "real":
-        print("Bancada encontrada. O modo automático será COLETA REAL.")
+        print("Bancada encontrada. Iniciando coleta.")
         rodar_modo_real(simulador)
         return "real"
-    if data_inicio is None:
-        # Usa os últimos sete dias completos para não gerar timestamps no futuro.
-        data_inicio = date.today() - timedelta(days=7)
-    print("Bancada não encontrada. O modo automático será SEMANA SINTÉTICA.")
-    rodar_modo_semana(data_inicio, enviar_s3)
-    return "semana"
+
+    print("Bancada não encontrada. Inicie bancadaVoo.py ou use --semana para gerar dados sintéticos.")
 
 
 if __name__ == "__main__":
     import argparse
 
-    # o próprio agente decide qual fonte usar.
-    terminal = argparse.ArgumentParser(description="Agente AirPulse com seleção automática de fonte")
+    # A coleta da bancada é o padrão.
+    terminal = argparse.ArgumentParser(description="Agente AirPulse para coleta da bancada")
+    terminal.add_argument("--semana", action="store_true", help="Gera uma semana de telemetria sintética.")
     terminal.add_argument("--inicio", default=None, help="Data inicial opcional do semanal (AAAA-MM-DD).")
     terminal.add_argument("--enviar-s3", action="store_true", help="Envia também o Bronze semanal ao S3.")
     comandos = terminal.parse_args()
     enviar_s3_env = os.getenv("ENVIAR_S3", "false").strip().lower() in ("1", "true", "yes", "sim")
     data_inicio = date.fromisoformat(comandos.inicio) if comandos.inicio else None
-    executar_automaticamente(data_inicio, comandos.enviar_s3 or enviar_s3_env)
+    executar_automaticamente(data_inicio, comandos.enviar_s3 or enviar_s3_env, semana=comandos.semana)
