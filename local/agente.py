@@ -109,7 +109,13 @@ def buscar_placas_da_api(hostname):
     endereco = os.getenv("AGENTE_API_URL", "").strip()
     email = os.getenv("AGENTE_EMAIL", "").strip()
     senha = os.getenv("AGENTE_SENHA", "")
-    if not endereco or not email or not senha:
+    faltantes = [
+        nome for nome, valor in (
+            ("AGENTE_API_URL", endereco), ("AGENTE_EMAIL", email), ("AGENTE_SENHA", senha),
+        ) if not valor
+    ]
+    if faltantes:
+        print(f"Login do agente sem configuração para: {', '.join(faltantes)}.")
         return []
 
     try:
@@ -122,25 +128,43 @@ def buscar_placas_da_api(hostname):
         conexao = HTTPConnection(url.hostname, url.port, timeout=5)
 
         base = url.path.rstrip("/").removesuffix("/agente/placas")
+        rota = f"{base}/usuario/autenticar"
+        print(f"Consultando placas do host {hostname}: POST {url.netloc}{rota}")
         credenciais = json.dumps({
             "emailServer": email, "senhaServer": senha, "cliente": "agente", "hostname": hostname,
         })
         with closing(conexao):
             conexao.request(
-                "POST", f"{base}/usuario/autenticar", body=credenciais,
+                "POST", rota, body=credenciais,
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
             )
             with conexao.getresponse() as resposta:
                 if resposta.status != 200:
-                    raise ValueError(f"Login retornou HTTP {resposta.status}.")
+                    detalhe = resposta.read(1024).decode("utf-8", errors="replace")
+                    try:
+                        mensagem = json.loads(detalhe)
+                    except ValueError:
+                        mensagem = detalhe
+                    if isinstance(mensagem, dict):
+                        mensagem = mensagem.get("mensagem") or mensagem.get("message") or mensagem.get("error")
+                    if isinstance(mensagem, str):
+                        campos_sensiveis = (email, senha, json.dumps(senha)[1:-1])
+                        for valor in campos_sensiveis:
+                            mensagem = mensagem.replace(valor, "[oculto]")
+                        mensagem = " ".join(mensagem.split())[:300]
+                    else:
+                        mensagem = ""
+                    raise ValueError(f"Login retornou HTTP {resposta.status}: {mensagem or 'sem detalhe'}.")
                 resultado = json.load(resposta)
 
         placas = resultado.get("placas") if isinstance(resultado, dict) else None
         if not isinstance(placas, list) or any(not isinstance(placa, str) for placa in placas):
             raise ValueError("Resposta sem uma lista válida de placas.")
-        return list(dict.fromkeys(placa.strip() for placa in placas if placa.strip()))
+        nomes = list(dict.fromkeys(placa.strip() for placa in placas if placa.strip()))
+        print(f"Login retornou HTTP 200 com {len(nomes)} placa(s) para o host {hostname}.")
+        return nomes
     except (HTTPException, OSError, ValueError) as erro:
-        print(f"API indisponível para listar placas ({erro}).")
+        print(f"Falha ao consultar placas no Node ({type(erro).__name__}): {erro}")
         return []
 
 # ============================================================================
