@@ -15,6 +15,7 @@ import multiprocessing as mp
 import socket
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import psutil
 
@@ -205,7 +206,7 @@ if __name__ == "__main__":
     caminho_flash = pasta_bancada / "fmc_flash_bite.log"
 
     # Metadados lidos pelo agente: fase explícita evita inferência por uptime.
-    sessao_origem = datetime.now(timezone.utc).strftime("VOO-%Y%m%dT%H%M%S.%fZ")
+    sessao_origem = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("VOO-%Y%m%dT%H%M%S.%f%z")
     meta_base = {
         "acelerador": ACELERADOR_DE_TEMPO,
         "cenario": args.cenario,
