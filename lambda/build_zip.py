@@ -19,6 +19,7 @@ ARQUIVOS_OBRIGATORIOS = {
     "numpy/__init__.py",
     "pandas/__init__.py",
     "pymysql/__init__.py",
+    "tzdata/zoneinfo/America/Sao_Paulo",
 }
 
 

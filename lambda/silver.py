@@ -160,6 +160,24 @@ def _inferir_intervalo(grupo: pd.DataFrame):
     return moda[0], "INFERIDO_TIMESTAMPS"
 
 
+def classificar_metrica(df, metrica):
+    # Sem valor ou limites, a leitura não recebe uma classificação de alerta.
+    lim_atencao, lim_critico = df[f"limiar_{metrica}_atencao"], df[f"limiar_{metrica}_critico"]
+    valores = df[metrica]
+    configurado = lim_atencao.notna() & lim_critico.notna()
+    em_critico = configurado & valores.ge(lim_critico)
+    em_atencao = configurado & valores.ge(lim_atencao) & valores.lt(lim_critico)
+    nivel = pd.Series("NORMAL", index=df.index, dtype="object")
+    nivel.loc[~configurado] = "NAO_CONFIGURADO"
+    nivel.loc[configurado & valores.isna()] = "NAO_DETERMINADO"
+    nivel.loc[em_atencao] = "ATENCAO"
+    nivel.loc[em_critico] = "CRITICO"
+    df[f"nivel_{metrica}"] = nivel
+    nao_avaliavel = ~configurado | valores.isna()
+    df[f"q_{metrica}_atencao"] = em_atencao.astype("boolean").mask(nao_avaliavel)
+    df[f"q_{metrica}_critico"] = em_critico.astype("boolean").mask(nao_avaliavel)
+
+
 def processar_camada_silver(df_bronze: pd.DataFrame, cadastro, componentes):
     # Transforma Bronze sem preencher métricas ou identidades desconhecidas com valores mentirosos.
     faltantes = [c for c in COLUNAS_BRONZE if c not in df_bronze.columns]
@@ -191,29 +209,15 @@ def processar_camada_silver(df_bronze: pd.DataFrame, cadastro, componentes):
         (df["ram_disponivel_bytes"] < 0) | (df["ram_disponivel_bytes"] > ram_total_valido))
     df["ram_disponivel_bytes"] = df["ram_disponivel_bytes"].where(~ram_disp_invalida)
     df["ram_disponivel_pct"] = df["ram_disponivel_bytes"] / ram_total_valido * 100
-    df["ram_pct"] = df["ram_logica_bytes"] / ram_total_valido * 100
+    df["ram_pct"] = (df["ram_logica_bytes"] / ram_total_valido * 100).clip(0, 100)
     flash_total_valido = df["flash_total_bytes"].where(df["flash_total_bytes"] > 0)
     df["flash_pct"] = df["flash_usada_bytes"].where(df["flash_usada_bytes"] >= 0) / flash_total_valido * 100
     # A fase vem dos metadados da bancada; sem ela, desconhecida (não deduz pelo uptime).
     df["fase"] = df["fase"].fillna("NAO_DETERMINADA").astype(str).str.strip().replace("", "NAO_DETERMINADA")
 
     df = _vincular_cadastro(df, cadastro, componentes)
-    # Compara cada métrica com os limites do próprio computador; sem limite, não inventa estado de alerta.
     for metrica in METRICAS_ALERTAVEIS:
-        lim_atencao, lim_critico = df[f"limiar_{metrica}_atencao"], df[f"limiar_{metrica}_critico"]
-        valores = df[metrica]
-        configurado = lim_atencao.notna() & lim_critico.notna()
-        em_critico = configurado & valores.ge(lim_critico)
-        em_atencao = configurado & valores.ge(lim_atencao) & valores.lt(lim_critico)
-        nivel = pd.Series("NORMAL", index=df.index, dtype="object")
-        nivel.loc[~configurado] = "NAO_CONFIGURADO"
-        nivel.loc[configurado & valores.isna()] = "NAO_DETERMINADO"
-        nivel.loc[em_atencao] = "ATENCAO"
-        nivel.loc[em_critico] = "CRITICO"
-        df[f"nivel_{metrica}"] = nivel
-        nao_avaliavel = ~configurado | valores.isna()
-        df[f"q_{metrica}_atencao"] = em_atencao.astype("boolean").mask(nao_avaliavel)
-        df[f"q_{metrica}_critico"] = em_critico.astype("boolean").mask(nao_avaliavel)
+        classificar_metrica(df, metrica)
 
     # Ordena por identidade e timestamp para que diferenças e alertas sigam a ordem temporal.
     df = df.sort_values(CHAVES_BASE + ["ts"], kind="mergesort", na_position="last").reset_index(drop=True)

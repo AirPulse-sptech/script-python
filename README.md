@@ -1,185 +1,136 @@
-# AirPulse — Python
+# AirPulse · ETL de telemetria
 
-Repositório responsável pelos códigos Python do projeto AirPulse.
+Este repositório simula o uso de CPU, RAM e disco de um FMC, coleta as leituras por placa e prepara os dados para os painéis e relatórios do AirPulse.
 
-O objetivo deste repositório é cuidar da **simulação, coleta, tratamento e carga dos dados de telemetria** usados nas análises.
-
----
-
-## Configurar a consulta de placas no agente
-
-Inicie a bancada com `python local/bancadaVoo.py` e, em outro terminal,
-execute `python local/agente.py`. Sem encontrar a bancada, o agente encerra.
-
-Na inicialização, o agente envia o hostname e o login do site para
-`POST /usuario/autenticar`. O Node autentica o usuário e devolve
-`{"placas":["P01","P02","P03"]}` para os hosts da empresa dele, na mesma
-resposta.
-
-Configure o endereço do Node e o login no `config/.env` do agente.
-
-```dotenv
-AGENTE_API_URL=http://IP_PUBLICO_DA_EC2
-AGENTE_EMAIL=seu.email@empresa.com
-AGENTE_SENHA='SUA_SENHA_DO_SITE'
+```text
+Bancada → Agente → Bronze (CSV bruto) → Silver (CSV tratado) → Gold (3 JSONs)
 ```
 
-Para teste na mesma máquina do Node, use `http://127.0.0.1:3333`. Na EC2,
-use o endereço da instância com a porta publicada pelo Node, se for diferente
-de 80. Em HTTP, o login trafega sem criptografia. Use credenciais de teste
-se a conexão passar pela internet pública.
+- [Rodar a coleta local](#rodar-a-coleta-local)
+- [Configurar as Lambdas na AWS](#configurar-as-lambdas-na-aws)
+- [Testar o fluxo automático na AWS](#testar-o-fluxo-automático-na-aws)
+- [Entender os dados Gold](#entender-os-dados-gold)
+- [Encontrar o código](#encontrar-o-código)
+- [Diagnosticar falhas](#diagnosticar-falhas)
 
-A coleta começa somente se o Node retornar pelo menos uma placa para o
-hostname do agente. Se a lista vier vazia ou a consulta falhar, o agente
-encerra antes de criar a sessão de coleta.
+## Rodar a coleta local
 
-O agente exige `BUCKET_NAME` e credenciais AWS para iniciar a coleta.
-O CSV local é usado para os uploads ao S3. Se uma publicação falhar, o
-agente encerra com erro e o CSV fica disponível no disco.
+Você vai precisar de Python 3.14, acesso ao backend do AirPulse, um usuário do site com uma placa cadastrada para o seu hostname e credenciais AWS com acesso ao bucket.
 
-## Horário das sessões
+1. Na raiz do repositório, instale as dependências e crie o arquivo de configuração. Reaproveite o `config/.env` se ele já existir.
 
-Os nomes das pastas e dos arquivos de sessão usam o horário de Brasília
-(`America/Sao_Paulo`) em qualquer máquina. Por exemplo, em
-`sessao=20261119T093524-0300`, a sessão começou às 09:35:24 no horário de Brasília.
-O identificador de voo da bancada segue o mesmo fuso. Os campos com sufixo
-`_utc` continuam em UTC para o processamento da telemetria.
+   ```powershell
+   python -m pip install -r local/requirements.txt
+   if (-not (Test-Path config/.env)) { Copy-Item config/.env.example config/.env }
+   ```
 
-Para atualizar as dependências do agente e da bancada, execute na raiz do projeto
-`python -m pip install -r local/requirements.txt`. A dependência `tzdata` fornece
-os dados de fuso em sistemas como o Windows.
+2. Preencha o `config/.env` com os dados do seu ambiente. O exemplo assume que o backend Node está na mesma máquina.
 
-## Gerar o ZIP das Lambdas
+   ```dotenv
+   AGENTE_API_URL=http://127.0.0.1:3333
+   AGENTE_EMAIL=seu.email@empresa.com
+   AGENTE_SENHA='SUA_SENHA_DO_SITE'
+   BUCKET_NAME=airpulse-s3
+   AWS_REGION=us-east-1
+   INTERVALO_COLETA_S=10
+   ```
 
-Na raiz do projeto, execute:
+   Se o backend estiver em outra máquina, use o endereço e a porta publicados. Use HTTP quando enviar o login pela internet. Para o S3, configure um perfil ou role acessível ao Boto3 ou informe as credenciais no `.env`. Mantenha o `.env` fora do Git.
+
+   Por padrão, o agente usa a RAM total do computador como referência. Se precisar informar uma capacidade específica, configure `RAM_TOTAL_BYTES` com um valor em bytes compatível com a memória medida.
+
+3. Inicie a bancada em um terminal e o agente em outro.
+
+   ```powershell
+   python local/bancadaVoo.py --acelerador 30
+   ```
+
+   ```powershell
+   python local/agente.py
+   ```
+
+   Com `--acelerador 30`, o roteiro leva cerca de cinco minutos reais. O agente identifica a bancada, consulta `POST /usuario/autenticar` para obter a lista de placas e envia os CSVs ao S3. Se a bancada ou as placas não forem encontradas, a coleta encerra.
+
+4. Deixe a bancada terminar com o agente em execução. Ao completar o envio, o agente grava o marcador `_concluido.json`. O terminal informa onde ficou o CSV local, que permanece disponível se o envio falhar.
+
+## Configurar as Lambdas na AWS
+
+Gere o pacote na raiz do repositório.
 
 ```powershell
 python lambda/build_zip.py
 ```
 
-O comando instala as dependências para Linux x86_64 com Python 3.14 e inclui
-os módulos da Lambda na raiz do arquivo. Após validar a estrutura e o limite
-para upload direto, ele grava `airpulse-etl.zip` na raiz do projeto. Se a
-validação falhar, o ZIP anterior fica disponível.
+O comando monta e valida `airpulse-etl.zip` para Python 3.14 em Linux x86_64. Envie esse mesmo ZIP para as duas funções e configure o handler e o gatilho de cada uma.
 
-No console da AWS, envie o mesmo ZIP para as duas funções e configure os
-handlers `bronze_to_silver.lambda_handler` e `silver_to_gold.lambda_handler`.
+| Função | Handler | Prefixo S3 | Sufixo S3 |
+| --- | --- | --- | --- |
+| Bronze → Silver | `bronze_to_silver.lambda_handler` | `01-bronze/` | `_concluido.json` |
+| Silver → Gold | `silver_to_gold.lambda_handler` | `02-silver/` | `_silver.csv` |
 
-## Variáveis de ambiente na AWS Lambda
+Use **All object create events** nos dois gatilhos. O marcador de conclusão inicia a etapa Bronze → Silver, e o CSV Silver inicia a etapa seguinte.
 
-Mantenha `config/.env` no computador para a coleta local. Na AWS, abra cada
-função e vá em **Configuration → Environment variables → Edit → Add environment
-variable**. Cadastre cada chave e valor separadamente e clique em **Save**.
+### Variáveis e permissões
 
-### Bronze → Silver
-
-| Variável | Valor |
-| --- | --- |
-| `BUCKET_NAME` | `airpulse-s3` |
-| `DB_HOST` | Endereço do servidor MySQL acessível pela Lambda |
-| `DB_PORT` | `3306`, se o MySQL usar a porta padrão |
-| `DB_DATABASE` | Nome do banco do AirPulse no MySQL |
-| `DB_USER` | Usuário do MySQL |
-| `DB_PASSWORD` | Senha do usuário do MySQL |
-
-Use o endereço real do servidor em `DB_HOST`. Os valores `localhost` e
-`127.0.0.1` apontam para o próprio ambiente da Lambda. Se mudar o prefixo
-padrão `01-bronze`, configure `S3_PREFIXO_BRONZE` com o mesmo prefixo usado
-pelo coletor e pelo gatilho S3.
-
-### Silver → Gold
-
-Cadastre apenas `BUCKET_NAME=airpulse-s3`. O CSV Silver já contém os dados
-de cadastro e os limites utilizados nessa etapa.
-
-As duas funções acessam o S3 com suas respectivas **roles de execução**.
-Mantenha as chaves AWS do `.env` local fora do ZIP.
-
-## Testar as Lambdas
-
-Use **Test → Create new event** na função correspondente, dê um nome ao
-evento, cole o JSON e clique em **Test**. Use objetos de uma sessão de teste
-concluída. A execução manual lê e grava objetos no bucket configurado.
-[Guia de testes no console da AWS](https://docs.aws.amazon.com/lambda/latest/dg/testing-functions.html)
-
-### Teste manual da Bronze → Silver
-
-Na função com handler `bronze_to_silver.lambda_handler`, use o evento abaixo.
-Troque o exemplo pela **chave completa do CSV** no S3, incluindo as pastas
-e o nome do arquivo. Use a chave sem `s3://` nem o nome do bucket.
-
-```json
-{
-  "bronze_key": "01-bronze/hostname=FMC-TESTE/sessao=SESSAO-TESTE/bronze_bruto_FMC-TESTE_SESSAO-TESTE.csv"
-}
-```
-
-A resposta deve trazer uma lista `silver` com a chave do arquivo
-`_silver.csv` em `02-silver/`. Use essa chave para testar a segunda função.
-
-### Teste manual da Silver → Gold
-
-Na função com handler `silver_to_gold.lambda_handler`, cole o evento abaixo.
-Troque `s3.object.key` dentro de `Records` pela chave que a primeira função
-retornou. Se estiver usando outro bucket, troque também `s3.bucket.name`.
-
-```json
-{
-  "Records": [
-    {
-      "eventSource": "aws:s3",
-      "eventName": "ObjectCreated:Put",
-      "s3": {
-        "bucket": { "name": "airpulse-s3" },
-        "object": {
-          "key": "02-silver/hostname=FMC-TESTE/sessao=SESSAO-TESTE/FMC-TESTE_SESSAO-TESTE_silver.csv"
-        }
-      }
-    }
-  ]
-}
-```
-
-A resposta deve trazer sete chaves em `gold`. Confira os JSONs no prefixo
-`03-gold/` da mesma sessão.
-
-### Teste do fluxo automático
-
-Configure os dois gatilhos S3 com **All object create events**.
-
-| Função | Prefixo | Sufixo |
+| Configuração | Bronze → Silver | Silver → Gold |
 | --- | --- | --- |
-| Bronze → Silver | `01-bronze/` | `_concluido.json` |
-| Silver → Gold | `02-silver/` | `_silver.csv` |
+| Bucket | `BUCKET_NAME=airpulse-s3` | `BUCKET_NAME=airpulse-s3` |
+| MySQL | `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USER` e `DB_PASSWORD` | O Silver já traz cadastro e limites |
+| Role de execução | Ler objetos Bronze e gravar objetos Silver | Listar o prefixo `02-silver/` com `s3:ListBucket`, ler os CSVs Silver e gravar objetos Gold |
 
-Rode uma nova coleta e deixe a bancada terminar com o agente em execução.
-No S3, confirme o marcador `_concluido.json` na pasta Bronze da sessão, o
-`_silver.csv` em Silver e os sete JSONs em Gold. O agente só publica o
-marcador quando conclui o envio da sessão.
-[Notificações S3 com filtro de prefixo e sufixo](https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-how-to-filtering.html)
+Use um endereço MySQL que a Lambda consiga alcançar em `DB_HOST` e informe a porta do servidor, normalmente `3306`. Se mudar o prefixo Bronze, atualize `S3_PREFIXO_BRONZE` no agente e na primeira Lambda, o filtro do gatilho e as permissões. As Lambdas usam as próprias roles de execução para o S3.
 
-Se o fluxo parar, confira a primeira saída que falta e abra os logs da
-função correspondente em **Monitor → View CloudWatch logs**.
-[Guia de logs da AWS](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-view.html)
+## Testar o fluxo automático na AWS
+
+Depois de configurar os gatilhos, rode uma coleta até o fim. No S3, procure a mesma pasta `hostname=.../sessao=...` nas três camadas.
+
+| Camada | O que deve aparecer |
+| --- | --- |
+| Bronze | CSV bruto e marcador `_concluido.json` |
+| Silver | CSV `_silver.csv`. Linhas sem computador ou placa cadastrada vão para `_quarentena.csv`. |
+| Gold | Três arquivos JSON descritos na próxima seção |
+
+## Entender os dados Gold
+
+Cada coleta publica três arquivos em `03-gold/hostname=<host>/sessao=<id>/`. Processar a mesma coleta de novo grava nas mesmas chaves.
+
+| Sufixo | Conteúdo |
+| --- | --- |
+| `_gold_monitoramento_placa.json` | Um registro por placa com o uso atual, horários, limites, estados, variações, Health Points e previsão do disco. A lista `sessoes` traz pico, horário e fase do pico, P95, minutos acima do crítico e diferença para o pico anterior. |
+| `_gold_serie_1min.json` | Média, pico e pior nível por placa e minuto observado. Fornece os pontos para gráficos e mapas de calor. |
+| `_gold_alertas.json` | Eventos de abertura, mudança de nível e encerramento. Inclui os IDs de vínculo, horários, percentual na abertura, limite e maior severidade. |
+
+No monitoramento, `sessao_id` identifica o voo ou, se faltar o ID do voo, a coleta e sua sessão interna. Os arquivos antigos de resumo e KPIs permanecem no S3 mesmo após reprocessar uma coleta.
+
+- CPU e RAM comparam o uso com a leitura mais próxima de uma hora antes, dentro de cinco minutos de tolerância. Disco usa a última leitura válida do dia anterior no horário de Brasília. Nos JSONs, o disco usa o prefixo `flash`. Se faltar referência, a variação fica `null`.
+- O uso de RAM fica entre 0% e 100%. Uma leitura que atinge ou excede a capacidade de referência aparece como 100%. O valor em bytes fica disponível no Silver.
+- A variação da saúde compara a nota da última hora com a da hora anterior. A estimativa do disco usa médias por minuto das últimas 24 horas.
+- Abertura e escalonamento de alertas exigem três leituras consecutivas no mesmo nível. Para recuperar, o valor precisa cair mais de cinco pontos percentuais abaixo do limite correspondente.
+- O nome da pasta usa o horário de Brasília. Os horários nos registros ficam em UTC. Por exemplo, `2026-11-24T21:53:00.000Z` corresponde a **24/11/2026 às 18:53** em Brasília.
+
+## Encontrar o código
+
+| Arquivo | O que procurar |
+| --- | --- |
+| [local/bancadaVoo.py](local/bancadaVoo.py) | Fases, duração e cenários do voo simulado |
+| [local/agente.py](local/agente.py) | Consulta de placas, leitura dos componentes e envio do Bronze |
+| [lambda/bronze_to_silver.py](lambda/bronze_to_silver.py) e [lambda/silver.py](lambda/silver.py) | Leitura do Bronze, limpeza, vínculo com o MySQL e quarentena |
+| [lambda/silver_to_gold.py](lambda/silver_to_gold.py) | Busca do histórico no S3 e publicação dos JSONs. Comece por `processar_objeto`. |
+| [lambda/gold.py](lambda/gold.py) | Regras de alertas, resumo, KPIs e série por minuto. Comece por `gerar_datasets_gold`. |
+| [lambda/etl_s3.py](lambda/etl_s3.py) e [lambda/contratos.py](lambda/contratos.py) | Validação dos eventos e das chaves S3, campos e métricas compartilhados |
+
+Se renomear um módulo da Lambda, atualize os imports, o handler correspondente e a lista de arquivos obrigatórios em [lambda/build_zip.py](lambda/build_zip.py). Mudanças no bucket ou nas chaves dos objetos também precisam ser refletidas nos gatilhos, nas permissões e no backend que lê os arquivos.
+
+## Diagnosticar falhas
+
+Comece pela primeira saída que faltou e abra os logs da função que deveria gravá-la. [Consultar logs da Lambda no CloudWatch](https://docs.aws.amazon.com/lambda/latest/dg/monitoring-cloudwatchlogs-view.html)
 
 | Sintoma | O que conferir |
 | --- | --- |
-| `Runtime.ImportModuleError` | Runtime Python 3.14, arquitetura x86_64, nome do handler e módulos na raiz do ZIP gerado pelo build. |
-| `MySQL indisponível` | Leia a causa registrada acima do erro genérico. `Connection refused` indica que a conexão foi recusada. O erro `1044` indica falta de acesso ao banco. |
-| `{"gold": []}` | Confira se o evento de criação contém a chave Silver com prefixo `02-silver/` e sufixo `_silver.csv`. |
-| O Bronze tem CSV, mas a Silver não aparece | Confira se existe um marcador `_concluido.json` para a mesma sessão e se o filtro do gatilho corresponde à chave. |
-
-## Renomear arquivos e recursos
-
-| O que mudar | O que atualizar |
-| --- | --- |
-| Nome de um evento salvo em **Test** | Escolha o nome que quiser. O código usa o JSON do evento. |
-| Nome da função na AWS | Se criar outra função com o novo nome, aponte os gatilhos e as referências ao ARN para ela. |
-| Nome de `bronze_to_silver.py`, `silver_to_gold.py` ou `lambda_handler` | Atualize o campo **Handler** da função e gere um novo ZIP. Se mudar o nome do arquivo, atualize também a lista `ARQUIVOS_OBRIGATORIOS` em `lambda/build_zip.py`. |
-| Nome de `silver.py`, `gold.py`, `contratos.py` ou `etl_s3.py` | Atualize os imports, a lista `ARQUIVOS_OBRIGATORIOS` e gere um novo ZIP. |
-| Nome do bucket | Atualize o coletor, `BUCKET_NAME` das duas funções, as permissões S3, os gatilhos e os serviços que leem o bucket. |
-| Prefixo ou sufixo de um objeto no S3 | Atualize o código que grava a chave, o que a lê e o filtro do gatilho. Por exemplo, `03-gold/` e `_gold_alertas.json` também são usados pelo backend de relatórios. |
-
-O campo **Handler** segue o formato `modulo.funcao`. Ao renomear um módulo,
-use um nome Python válido, como `bronze_para_silver`.
-[Nome do handler na AWS](https://docs.aws.amazon.com/lambda/latest/dg/python-handler.html#python-handler-naming)
+| O agente encerra antes de coletar | A bancada precisa estar rodando e o Node precisa devolver ao menos uma placa para o hostname do agente. |
+| Há CSV Bronze, mas o Silver não aparece | Procure o marcador `_concluido.json` na mesma sessão e confira o filtro do gatilho. Se houver só quarentena, confira o cadastro no MySQL. |
+| `MySQL indisponível` | Confira o endereço, a porta e o acesso ao banco. O log registra a causa da falha. |
+| `Runtime.ImportModuleError` | Confira o handler, Python 3.14, arquitetura x86_64 e os módulos na raiz do ZIP. |
+| A função Gold retorna `{"gold":[]}` | A chave do evento precisa começar com `02-silver/` e terminar em `_silver.csv`. |
+| A função Gold retorna `AccessDenied` ao buscar histórico | Confira `s3:ListBucket` no bucket e a permissão de leitura dos CSVs Silver na role de execução. |
+| Uma variação aparece como `null` | Verifique se há amostras na janela de comparação. Uma coleta curta já gera pontos no gráfico, mas precisa de histórico para comparar com uma hora antes ou com o dia anterior. |
