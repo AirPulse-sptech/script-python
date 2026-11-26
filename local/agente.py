@@ -193,8 +193,6 @@ def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline
     if "DISCO" in comp:
         try:
             flash = os.path.getsize(os.path.join(cwd, placa["arquivo_flash"]))
-        except FileNotFoundError:
-            flash = 0
         except (OSError, TypeError):
             flash = None
         rc, ru = _ler_contador_io(proc, "read")
@@ -236,32 +234,37 @@ def encontrar_processo_simulador():
         _normalizar_nome_processo("bancadaVoo.py"),
     }
     alvos.discard("")
-    candidatos = {}
+    candidatos = []
     for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
         try:
             if proc.pid == os.getpid():
                 continue
             cmd = proc.info.get("cmdline") or []
             if any(_normalizar_nome_processo(arg) in alvos for arg in cmd[1:]):
-                candidatos[proc.pid] = proc
+                candidatos.append(proc)
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             # O processo pode encerrar ou ficar inacessível durante a varredura.
             continue
-    # Prefere o processo raiz quando o mesmo comando aparece nos processos filhos.
-    for proc in candidatos.values():
-        try:
-            if proc.info.get("ppid") not in candidatos:
-                return proc
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
+    # Launchers do Python no Windows podem repetir a linha de comando da bancada.
+    for proc in candidatos:
+        if ler_metadados_bancada(proc, permitir_cwd=False):
+            return proc
+
+    # Metadados antigos no cwd são compartilhados entre o launcher e seu filho.
+    pids_pai = {proc.info.get("ppid") for proc in candidatos}
+    for proc in candidatos:
+        if proc.pid not in pids_pai and ler_metadados_bancada(proc):
+            return proc
     return None
 
 
-def ler_metadados_bancada(proc):
+def ler_metadados_bancada(proc, *, permitir_cwd=True):
     # Procura os metadados da sessão do PID e depois na pasta de execução.
     try:
         caminho = os.path.join(PASTA_DADOS, f"bancada-{proc.pid}", ARQUIVO_META)
         if not os.path.exists(caminho):
+            if not permitir_cwd:
+                return {}
             caminho = os.path.join(proc.cwd(), ARQUIVO_META)
         with open(caminho, encoding="utf-8") as arquivo:
             dados = json.load(arquivo)
@@ -544,6 +547,8 @@ def rodar_modo_real(simulador_inicial=None):
             if proximo_ciclo <= agora_monotonico:
                 proximo_ciclo = agora_monotonico + INTERVALO_COLETA_S
             metadados = ler_metadados_bancada(simulador)
+            if not metadados:
+                continue
             try:
                 fator_tempo = float(metadados.get("acelerador", 1))
             except (TypeError, ValueError):
