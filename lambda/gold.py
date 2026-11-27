@@ -8,6 +8,8 @@ from contratos import CHAVES_AGRUPAMENTO, CHAVES_BASE, METRICAS_ALERTAVEIS
 FUSO_BRASILIA = "America/Sao_Paulo"
 UMA_HORA = pd.Timedelta(hours=1)
 UM_DIA = pd.Timedelta(days=1)
+UM_MINUTO = pd.Timedelta(minutes=1)
+UM_SEGUNDO = pd.Timedelta(seconds=1)
 TOLERANCIA_HORA = pd.Timedelta(minutes=5)
 SAUDE_ATENCAO = 70
 SAUDE_CRITICO = 40
@@ -106,6 +108,7 @@ def _eventos_componente(grupo, identificadores, metrica, limites, ocorrencias):
             "metrica": metrica,
             "tipo_evento": evento,
             "nivel": nivel_evento,
+            "nivel_apos_evento": nivel_ativo or "NORMAL",
             "valor": round(float(valor), 4),
             "limiar_violado": limite_critico if nivel_evento == "CRITICO" else limite_atencao,
             "ts_abertura": ts_abertura,
@@ -115,12 +118,12 @@ def _eventos_componente(grupo, identificadores, metrica, limites, ocorrencias):
         }
 
 
-def gerar_alertas(df_silver: pd.DataFrame):
+def gerar_alertas(df_silver: pd.DataFrame, *, incluir_sessao=False):
     registros = []
     ocorrencias = {}
-    for (hostname, placa_serie, _), leituras in df_silver.groupby(CHAVES_AGRUPAMENTO, dropna=False, sort=False):
-        identificadores = {"hostname": hostname, "placa_serie": placa_serie}
-        grupo = leituras.sort_values("ts").reset_index(drop=True)
+    for chaves, leituras in df_silver.groupby(CHAVES_AGRUPAMENTO, dropna=False, sort=False):
+        identificadores = dict(zip(CHAVES_AGRUPAMENTO, chaves))
+        grupo = leituras.sort_values("ts", kind="stable").reset_index(drop=True)
         for metrica in METRICAS_ALERTAVEIS:
             limites = _limites_do_grupo(grupo, metrica)
             if limites is not None:
@@ -129,7 +132,8 @@ def gerar_alertas(df_silver: pd.DataFrame):
     for registro in registros:
         registro.update(ocorrencias[registro["alerta_id"]])
     colunas = [
-        *CHAVES_BASE, "alerta_id", "metrica", "tipo_evento", "nivel", "valor",
+        *(CHAVES_AGRUPAMENTO if incluir_sessao else CHAVES_BASE),
+        "alerta_id", "metrica", "tipo_evento", "nivel", "nivel_apos_evento", "valor",
         "limiar_violado", "ts_abertura", "ts_evento", "ts_encerramento",
         "em_aberto_apos_evento", "valor_abertura_pct", "maior_nivel",
     ]
@@ -245,21 +249,93 @@ def calcular_kpis_sessoes(grupo, coleta_id):
         yield kpis
 
 
-def calcular_serie_minuto(silver):
+def _duracao_alertas_minuto(silver, proximos_instantes, metrica, nome):
+    nivel = silver[f"nivel_{metrica}"]
+    intervalos = silver.loc[nivel.isin(["ATENCAO", "CRITICO"]) & proximos_instantes.notna(), CHAVES_BASE + ["ts"]]
+    intervalos = intervalos.assign(fim=proximos_instantes, nivel=nivel)
+    registros = []
+    for hostname, placa, inicio, fim, estado in intervalos.itertuples(index=False, name=None):
+        while inicio < fim:
+            minuto = inicio.floor("min")
+            fim_trecho = min(fim, minuto + UM_MINUTO)
+            registros.append((hostname, placa, minuto, estado, (fim_trecho - inicio).value))
+            inicio = fim_trecho
+
+    chaves_minuto = CHAVES_BASE + ["ts"]
+    colunas_duracao = {"CRITICO": f"{nome}_segundos_critico", "ATENCAO": f"{nome}_segundos_atencao"}
+    if not registros:
+        return silver[chaves_minuto].iloc[:0].assign(**dict.fromkeys(colunas_duracao.values(), 0.0))
+    duracoes = pd.DataFrame(registros, columns=chaves_minuto + ["nivel", "nanossegundos"])
+    por_nivel = duracoes.groupby(chaves_minuto + ["nivel"])["nanossegundos"].sum().unstack("nivel")
+    return (
+        por_nivel.reindex(columns=colunas_duracao).div(UM_SEGUNDO.value)
+        .rename(columns=colunas_duracao).reset_index().rename_axis(columns=None)
+    )
+
+
+def calcular_serie_minuto(silver, alertas=None):
+    if alertas is None:
+        alertas = gerar_alertas(silver, incluir_sessao=True)
+    silver = silver.sort_values("ts", kind="stable").reset_index(drop=True)
+    chaves_amostras = silver[CHAVES_AGRUPAMENTO + ["ts"]]
+    # Conta até a próxima leitura consecutiva da sessão, sem extrapolar lacunas ou a última amostra.
+    ts_consecutivo = silver["ts"].where(_amostras_consecutivas(silver))
+    proximos_instantes = ts_consecutivo.groupby(
+        [silver[chave] for chave in CHAVES_AGRUPAMENTO], dropna=False, sort=False
+    ).shift(-1)
     agregacoes = {}
     for metrica, nome in NOMES_METRICAS.items():
+        nivel = f"nivel_{metrica}"
+        avaliada = silver[nivel].isin(SEVERIDADE)
+        estado = pd.Series("NORMAL", index=silver.index).where(avaliada)
+        eventos = alertas.loc[
+            alertas["metrica"].eq(metrica), CHAVES_AGRUPAMENTO + ["ts_evento", "nivel_apos_evento"]
+        ]
+        if not eventos.empty:
+            # Cada amostra herda o estado da última transição confirmada da própria sessão.
+            eventos = eventos.rename(columns={"ts_evento": "ts"}).astype(chaves_amostras.dtypes.to_dict())
+            estados_confirmados = pd.merge_asof(
+                chaves_amostras, eventos, on="ts", by=CHAVES_AGRUPAMENTO,
+            )
+            estado = estados_confirmados["nivel_apos_evento"].fillna(estado)
+        silver[nivel] = estado
         agregacoes[f"{nome}_media"] = (metrica, "mean")
         agregacoes[f"{nome}_pico"] = (metrica, "max")
-        silver = silver.assign(**{f"nivel_{metrica}": silver[f"nivel_{metrica}"].map(SEVERIDADE)})
-        agregacoes[f"{nome}_nivel"] = (f"nivel_{metrica}", "max")
+        agregacoes[f"{nome}_nivel"] = (nivel, lambda estados: estados.iloc[-1])
     serie = (
         silver.groupby(CHAVES_BASE + [pd.Grouper(key="ts", freq="1min")], observed=True)
         .agg(**agregacoes)
         .reset_index()
     )
-    for nome in NOMES_METRICAS.values():
-        serie[f"{nome}_nivel"] = serie[f"{nome}_nivel"].map(NIVEIS)
-    return serie.round({coluna: 3 for coluna in agregacoes if not coluna.endswith("_nivel")})
+    serie = serie.round({coluna: 3 for coluna in agregacoes if not coluna.endswith("_nivel")})
+    for metrica, nome in NOMES_METRICAS.items():
+        duracoes = _duracao_alertas_minuto(silver, proximos_instantes, metrica, nome)
+        serie = serie.merge(duracoes, on=CHAVES_BASE + ["ts"], how="outer")
+        critico, atencao = f"{nome}_segundos_critico", f"{nome}_segundos_atencao"
+        serie[[critico, atencao]] = serie[[critico, atencao]].fillna(0.0)
+        nivel = pd.Series("NORMAL", index=serie.index).where(serie[f"{nome}_nivel"].notna())
+        nivel = nivel.mask(serie[atencao].gt(serie[critico]), "ATENCAO")
+        nivel = nivel.mask(serie[critico].gt(0) & serie[critico].ge(serie[atencao]), "CRITICO")
+        serie[f"{nome}_nivel_predominante"] = nivel
+    return serie
+
+
+def classificar_eventos_por_minuto(alertas, serie):
+    eventos = alertas.drop(columns=["sessao", "nivel_apos_evento"])
+    if eventos.empty:
+        return eventos
+
+    campos = {f"{nome}_nivel_predominante": metrica for metrica, nome in NOMES_METRICAS.items()}
+    chaves = CHAVES_BASE + ["minuto"]
+    niveis = serie.rename(columns={"ts": "minuto", **campos}).melt(
+        id_vars=chaves, value_vars=list(campos.values()), var_name="metrica", value_name="nivel_predominante",
+    )
+    niveis = niveis.loc[niveis["nivel_predominante"].isin(["ATENCAO", "CRITICO"])]
+    eventos = eventos.assign(minuto=eventos["ts_evento"].dt.floor("min")).merge(
+        niveis, on=chaves + ["metrica"], how="left", validate="many_to_one",
+    )
+    eventos["nivel"] = eventos["nivel_predominante"].fillna(eventos["nivel"])
+    return eventos.drop(columns=["minuto", "nivel_predominante"])
 
 
 def _saude_hora(grupo, fim):
@@ -343,7 +419,8 @@ def criar_resumo_placa(grupo, atual):
 
 
 def gerar_datasets_gold(silver, historico, coleta_id):
-    alertas = vincular_componente_alertas(gerar_alertas(silver), silver)
+    alertas = gerar_alertas(silver, incluir_sessao=True)
+    serie = calcular_serie_minuto(silver, alertas)
     grupos_historico = dict(tuple(historico.groupby(CHAVES_BASE, sort=False)))
     monitoramento_placas = []
     for identidade, atual in silver.groupby(CHAVES_BASE, sort=False):
@@ -356,7 +433,7 @@ def gerar_datasets_gold(silver, historico, coleta_id):
         monitoramento_placas.append(monitoramento)
 
     return {
-        "gold_alertas": alertas,
+        "gold_alertas": vincular_componente_alertas(classificar_eventos_por_minuto(alertas, serie), silver),
         "gold_monitoramento_placa": pd.DataFrame(monitoramento_placas),
-        "gold_serie_1min": calcular_serie_minuto(silver),
+        "gold_serie_1min": serie,
     }

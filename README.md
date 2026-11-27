@@ -97,8 +97,8 @@ Cada coleta publica três arquivos em `03-gold/hostname=<host>/sessao=<id>/`. Pr
 | Sufixo | Conteúdo |
 | --- | --- |
 | `_gold_monitoramento_placa.json` | Um registro por placa com o uso atual, horários, limites, estados, variações, Health Points e previsão do disco. A lista `sessoes` traz pico, horário e fase do pico, P95, minutos acima do crítico e diferença para o pico anterior. |
-| `_gold_serie_1min.json` | Média, pico e pior nível por placa e minuto observado. Fornece os pontos para gráficos e mapas de calor. |
-| `_gold_alertas.json` | Eventos de abertura, mudança de nível e encerramento. Inclui os IDs de vínculo, horários, percentual na abertura, limite e maior severidade. |
+| `_gold_serie_1min.json` | Média, pico, estado na última amostra e classificação pela duração do alerta. Para CPU, os novos campos são `cpu_segundos_critico`, `cpu_segundos_atencao` e `cpu_nivel_predominante`. RAM e Flash seguem o mesmo padrão. |
+| `_gold_alertas.json` | Eventos de abertura, mudança de nível e encerramento com os horários exatos. `nivel` usa o estado predominante no minuto de `ts_evento`. Se ainda não houver duração medida naquele minuto, usa o nível do evento. `limiar_violado` e `maior_nivel` descrevem a transição e a ocorrência observadas. |
 
 No monitoramento, `sessao_id` identifica o voo ou, se faltar o ID do voo, a coleta e sua sessão interna. Os arquivos antigos de resumo e KPIs permanecem no S3 mesmo após reprocessar uma coleta.
 
@@ -106,6 +106,7 @@ No monitoramento, `sessao_id` identifica o voo ou, se faltar o ID do voo, a cole
 - O uso de RAM fica entre 0% e 100%. Uma leitura que atinge ou excede a capacidade de referência aparece como 100%. O valor em bytes fica disponível no Silver.
 - A variação da saúde compara a nota da última hora com a da hora anterior. A estimativa do disco usa médias por minuto das últimas 24 horas.
 - Abertura e escalonamento de alertas exigem três leituras consecutivas no mesmo nível. Para recuperar, o valor precisa cair mais de cinco pontos percentuais abaixo do limite correspondente.
+- A duração começa na confirmação do alerta (`ts_evento`). O Gold divide os intervalos consecutivos na virada de cada minuto e classifica pelo nível com mais segundos, com desempate em favor de `CRITICO`. Lacunas de coleta e o tempo após a última leitura ficam fora da contagem.
 - O nome da pasta usa o horário de Brasília. Os horários nos registros ficam em UTC. Por exemplo, `2026-11-24T21:53:00.000Z` corresponde a **24/11/2026 às 18:53** em Brasília.
 
 ## Encontrar o código

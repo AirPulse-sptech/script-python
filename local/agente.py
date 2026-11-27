@@ -170,7 +170,7 @@ def buscar_placas_da_api(hostname):
 # ============================================================================
 # Montagem da amostra de telemetria
 
-def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram):
+def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram, cpu_pct_host):
     comp = placa["componentes"]
     a = dict.fromkeys(COLUNAS)  # vazio por padrão: só preenche o que a placa mede
     cpu_bruto, tarefas = medir_cpu_e_tarefas(proc, cache)
@@ -183,7 +183,7 @@ def amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline
     })
     if "CPU" in comp:
         nucleos = psutil.cpu_count(logical=True) or 1
-        a.update({"cpu_percent": cpu_bruto, "cpu_nucleos": nucleos, "cpu_pct_host": cpu_bruto / nucleos,
+        a.update({"cpu_percent": cpu_bruto, "cpu_nucleos": nucleos, "cpu_pct_host": cpu_pct_host,
                   "cpu_semantica": "soma_percentual_por_nucleo"})
     if "RAM" in comp:
         a.update({"ram_usada_bytes": proc.memory_info().rss, "ram_baseline_bytes": baseline_ram,
@@ -350,7 +350,7 @@ def salvar_localmente(amostra, caminho_destino=CAMINHO_CSV):
         if cpu_exibida is not None:
             print(
                 f"[{amostra['timestamp_utc']}] Amostra #{amostra['seq']} | "
-                f"CPU host estimada: {float(cpu_exibida):.1f}%"
+                f"CPU total do host: {float(cpu_exibida):.1f}%"
             )
 
 
@@ -534,6 +534,7 @@ def rodar_modo_real(simulador_inicial=None):
     seq_placa = {}
     ciclos = 0
     print(f"Bancada detectada (PID {simulador.pid}). Coletando placas no host {HOSTNAME}.")
+    psutil.cpu_percent(interval=None)  # Prepara a medição do host para o primeiro intervalo de coleta.
     proximo_ciclo = time.monotonic() + INTERVALO_COLETA_S
     while True:
         try:
@@ -546,6 +547,7 @@ def rodar_modo_real(simulador_inicial=None):
             proximo_ciclo += INTERVALO_COLETA_S
             if proximo_ciclo <= agora_monotonico:
                 proximo_ciclo = agora_monotonico + INTERVALO_COLETA_S
+            cpu_pct_host = psutil.cpu_percent(interval=None)
             metadados = ler_metadados_bancada(simulador)
             if not metadados:
                 continue
@@ -566,7 +568,9 @@ def rodar_modo_real(simulador_inicial=None):
                         procs_placa[nome] = (proc, cache)
                         continue
                     proc, cache = procs_placa[nome]
-                    amostra = amostrar_placa(placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram)
+                    amostra = amostrar_placa(
+                        placa, proc, cache, cwd, ts, metadados, fator_tempo, baseline_ram, cpu_pct_host
+                    )
                 except psutil.Error:
                     procs_placa.pop(nome, None)  # Descarta o processo para localizá-lo novamente no próximo ciclo.
                     continue
